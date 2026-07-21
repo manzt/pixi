@@ -21,6 +21,74 @@ from .common import (
 )
 
 
+def test_run_script_requires_inline_metadata(
+    pixi: Path, tmp_pixi_workspace: Path
+) -> None:
+    script = tmp_pixi_workspace / "example.py"
+    script.write_text("print('hello')\n")
+
+    verify_cli_command(
+        [pixi, "run", "--script", script],
+        ExitCode.FAILURE,
+        stderr_contains=["does not contain a PEP 723 metadata block", "pixi init --script"],
+    )
+    assert script.read_text() == "print('hello')\n"
+
+
+@pytest.mark.slow
+def test_run_script_is_isolated_and_does_not_create_a_lock(
+    pixi: Path, tmp_pixi_workspace: Path
+) -> None:
+    (tmp_pixi_workspace / "pixi.toml").write_text(
+        f'''[workspace]
+name = "enclosing"
+channels = []
+platforms = ["{CURRENT_PLATFORM}"]
+'''
+    )
+    script = tmp_pixi_workspace / "scripts" / "example.py"
+    script.parent.mkdir()
+    script.write_text(
+        f'''# /// script
+# requires-python = ">= 3.11"
+# dependencies = []
+#
+# [tool.pixi.workspace]
+# channels = ["conda-forge"]
+# platforms = ["{CURRENT_PLATFORM}"]
+# ///
+import json
+import os
+import sys
+
+print(json.dumps({{
+    "argv": sys.argv[1:],
+    "cwd": os.getcwd(),
+    "manifest": os.environ["PIXI_PROJECT_MANIFEST"],
+}}))
+'''
+    )
+
+    verify_cli_command(
+        [pixi, "run", "--script", script, "first", "--second"],
+        cwd=tmp_pixi_workspace,
+        env={
+            "PIXI_PROJECT_ROOT": str(tmp_pixi_workspace),
+            "PIXI_ENVIRONMENT_NAME": "ignored",
+        },
+        stdout_contains=json.dumps(
+            {
+                "argv": ["first", "--second"],
+                "cwd": str(tmp_pixi_workspace),
+                "manifest": str(script),
+            }
+        ),
+    )
+
+    assert not script.with_name("example.py.pixi.lock").exists()
+    assert not (tmp_pixi_workspace / ".pixi").exists()
+
+
 def test_run_in_shell_environment(pixi: Path, tmp_pixi_workspace: Path) -> None:
     manifest = tmp_pixi_workspace.joinpath("pixi.toml")
     toml = f"""
