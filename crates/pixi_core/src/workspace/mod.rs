@@ -195,6 +195,7 @@ pub struct Workspace {
 enum WorkspaceStorage {
     Project,
     Script {
+        manifest: ScriptManifest,
         pixi_dir: PathBuf,
         lock_file_path: PathBuf,
     },
@@ -465,6 +466,7 @@ impl Workspace {
         config: Config,
     ) -> miette::Result<WithWarnings<Self>> {
         let script_path = script.path().to_owned();
+        let script_manifest = script.clone();
         let script_config = script.workspace_config()?;
         let (mut manifest, warnings) = script.into_workspace_manifest()?;
 
@@ -501,6 +503,7 @@ impl Workspace {
             root,
             config,
             WorkspaceStorage::Script {
+                manifest: script_manifest,
                 pixi_dir,
                 lock_file_path,
             },
@@ -1335,7 +1338,10 @@ mod tests {
     use insta::{assert_debug_snapshot, assert_snapshot};
     use itertools::Itertools;
     use pixi_config::{CacheConfig, Config, DetachedEnvironments};
-    use pixi_manifest::{FeatureName, FeaturesExt, HasWorkspaceManifest, script::ScriptManifest};
+    use pixi_manifest::{
+        DependencyOverwriteBehavior, FeatureName, FeaturesExt, HasWorkspaceManifest,
+        script::ScriptManifest,
+    };
     use pypi_mapping::{MappingMode, ProjectDefinedChannelMapping, ProjectDefinedMappingLocation};
     use rattler_conda_types::{Channel, NamedChannelOrUrl, Platform, Version};
     use url::Url;
@@ -2090,6 +2096,123 @@ print("hello")
                 .collect::<Vec<_>>(),
             [Platform::current()]
         );
+    }
+
+    #[tokio::test]
+    async fn script_workspace_mutations_write_only_the_metadata_block() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let path = root.path().join("example.py");
+        let workspace = script_workspace(
+            r#"# /// script
+# dependencies = []
+#
+# [tool.uv]
+# prerelease = "allow"
+# ///
+print("hello")
+"#,
+            root.path(),
+            cache.path(),
+        );
+        let mut workspace = workspace.modify().unwrap();
+        workspace
+            .manifest()
+            .add_dependency(
+                &"dummy-a".parse().unwrap(),
+                &pixi_spec::PixiSpec::from(
+                    "*".parse::<rattler_conda_types::VersionSpec>().unwrap(),
+                ),
+                SpecType::Run,
+                &[],
+                &FeatureName::Default,
+                DependencyOverwriteBehavior::Overwrite,
+            )
+            .unwrap();
+        let requirement = "requests>=2".parse::<Requirement>().unwrap();
+        workspace
+            .manifest()
+            .add_pep508_dependency(
+                (&requirement, None),
+                &[],
+                &FeatureName::Default,
+                None,
+                DependencyOverwriteBehavior::Overwrite,
+                None,
+            )
+            .unwrap();
+        workspace.save().await.unwrap();
+
+        let contents = fs_err::read_to_string(&path).unwrap();
+        assert!(contents.ends_with("print(\"hello\")\n"));
+        let metadata = ScriptManifest::from_path(path)
+            .unwrap()
+            .unwrap()
+            .metadata_document()
+            .unwrap();
+        assert_eq!(metadata["dependencies"][0].as_str(), Some("requests>=2"));
+        assert_eq!(metadata["tool"]["uv"]["prerelease"].as_str(), Some("allow"));
+        assert_eq!(
+            metadata["tool"]["pixi"]["dependencies"]["dummy-a"].as_str(),
+            Some("*")
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_script_workspace_can_be_modified_again() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let path = root.path().join("example.py");
+        let workspace = script_workspace(
+            r#"# /// script
+# dependencies = []
+# ///
+print("hello")
+"#,
+            root.path(),
+            cache.path(),
+        );
+
+        let mut workspace = workspace.modify().unwrap();
+        workspace
+            .manifest()
+            .add_dependency(
+                &"dummy-a".parse().unwrap(),
+                &pixi_spec::PixiSpec::from(
+                    "*".parse::<rattler_conda_types::VersionSpec>().unwrap(),
+                ),
+                SpecType::Run,
+                &[],
+                &FeatureName::Default,
+                DependencyOverwriteBehavior::Overwrite,
+            )
+            .unwrap();
+        let workspace = workspace.save().await.unwrap();
+
+        let mut workspace = workspace.modify().unwrap();
+        workspace
+            .manifest()
+            .add_dependency(
+                &"dummy-b".parse().unwrap(),
+                &pixi_spec::PixiSpec::from(
+                    "*".parse::<rattler_conda_types::VersionSpec>().unwrap(),
+                ),
+                SpecType::Run,
+                &[],
+                &FeatureName::Default,
+                DependencyOverwriteBehavior::Overwrite,
+            )
+            .unwrap();
+        workspace.save().await.unwrap();
+
+        let metadata = ScriptManifest::from_path(path)
+            .unwrap()
+            .unwrap()
+            .metadata_document()
+            .unwrap();
+        let dependencies = &metadata["tool"]["pixi"]["dependencies"];
+        assert_eq!(dependencies["dummy-a"].as_str(), Some("*"));
+        assert_eq!(dependencies["dummy-b"].as_str(), Some("*"));
     }
 
     #[test]

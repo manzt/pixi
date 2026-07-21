@@ -1,19 +1,22 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, path::PathBuf};
 
 use clap::Parser;
+use miette::IntoDiagnostic;
 use pep508_rs::Requirement;
 use pixi_api::{
     WorkspaceContext,
     workspace::{DependencyOptions, GitOptions},
 };
-use pixi_config::ConfigCli;
+use pixi_config::{Config, ConfigCli};
 use pixi_consts::consts;
 use pixi_core::{
-    DependencyType, WorkspaceLocator,
+    DependencyType, Workspace, WorkspaceLocator,
+    environment::LockFileUsage,
     workspace::{PypiDeps, SkippedPackage},
 };
-use pixi_manifest::HasFeaturesIter;
+use pixi_manifest::{HasFeaturesIter, script::ScriptManifest};
 use pixi_pypi_spec::{PixiPypiSource, PixiPypiSpec, PypiPackageName};
+use rattler_conda_types::Platform;
 use url::Url;
 
 use crate::{
@@ -88,6 +91,25 @@ pub struct Args {
     #[clap(flatten)]
     pub workspace_config: WorkspaceConfig,
 
+    /// Add dependencies to a Python script's inline PEP 723 metadata.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = [
+            "manifest_path",
+            "workspace",
+            "host",
+            "build",
+            "platforms",
+            "feature",
+            "environment",
+            "git",
+            "editable",
+            "index"
+        ]
+    )]
+    pub script: Option<PathBuf>,
+
     #[clap(flatten)]
     pub dependency_config: DependencyConfig,
 
@@ -111,19 +133,6 @@ pub struct Args {
     /// Only applicable when adding pypi dependencies.
     #[clap(long, requires = "pypi", conflicts_with = "git")]
     pub index: Option<Url>,
-}
-
-impl TryFrom<&Args> for DependencyOptions {
-    type Error = miette::Error;
-
-    fn try_from(args: &Args) -> miette::Result<Self> {
-        Ok(DependencyOptions {
-            feature: args.dependency_config.feature_name(),
-            platforms: args.dependency_config.platforms.clone(),
-            no_install: args.no_install_config.no_install,
-            lock_file_usage: args.lock_file_update_config.lock_file_usage()?,
-        })
-    }
 }
 
 impl From<&Args> for GitOptions {
@@ -170,17 +179,49 @@ fn map_pypi_requirements_with_index(
 }
 
 pub async fn execute(args: Args) -> miette::Result<()> {
-    let mut workspace = WorkspaceLocator::for_cli()
-        .with_global_config_source(args.config_source.source())
-        .with_search_start(args.workspace_config.workspace_locator_start())
-        .locate()?
-        .with_cli_config(args.config.clone());
+    let mut workspace = if let Some(path) = &args.script {
+        let path = std::path::absolute(path).into_diagnostic()?;
+        let root = path
+            .parent()
+            .expect("an absolute script path always has a parent");
+        let config = Config::load_with(root, &args.config_source.source())
+            .merge_config(args.config.clone().into());
+        let script = if path.exists() {
+            match ScriptManifest::from_path(&path)? {
+                Some(script) => script,
+                None => initialize_script(&path, &config)?,
+            }
+        } else {
+            initialize_script(&path, &config)?
+        };
+        let script_workspace = Workspace::from_script(script, config)?;
+        for warning in script_workspace.warnings {
+            tracing::warn!("{warning}");
+        }
+        script_workspace.value
+    } else {
+        WorkspaceLocator::for_cli()
+            .with_global_config_source(args.config_source.source())
+            .with_search_start(args.workspace_config.workspace_locator_start())
+            .locate()?
+            .with_cli_config(args.config.clone())
+    };
 
     // Apply backend override if provided (primarily for testing)
     if let Some(backend_override) = args.workspace_config.backend_override.clone() {
         workspace = workspace.with_backend_override(backend_override);
     }
 
+    let dependency_options = DependencyOptions {
+        feature: args.dependency_config.feature_name(),
+        platforms: args.dependency_config.platforms.clone(),
+        no_install: args.no_install_config.no_install,
+        lock_file_usage: add_lock_file_usage(
+            args.lock_file_update_config.lock_file_usage()?,
+            args.script.is_some(),
+            workspace.lock_file_path().is_file(),
+        ),
+    };
     let workspace_ctx = WorkspaceContext::new(CliInterface {}, workspace.clone());
 
     let (update_deps, skipped, parsed_names): (_, Vec<SkippedPackage>, Vec<String>) =
@@ -203,7 +244,7 @@ pub async fn execute(args: Args) -> miette::Result<()> {
                     .map(|n| n.as_normalized().to_string())
                     .collect();
                 let result = workspace_ctx
-                    .add_conda_deps(specs, spec_type, (&args).try_into()?, git_options)
+                    .add_conda_deps(specs, spec_type, dependency_options, git_options)
                     .await?;
                 (result.0, result.1, names)
             }
@@ -225,7 +266,7 @@ pub async fn execute(args: Args) -> miette::Result<()> {
                     .map(|n| n.as_normalized().to_string())
                     .collect();
                 let result = workspace_ctx
-                    .add_pypi_deps(pypi_deps, args.editable, (&args).try_into()?)
+                    .add_pypi_deps(pypi_deps, args.editable, dependency_options)
                     .await?;
                 (result.0, result.1, names)
             }
@@ -320,4 +361,72 @@ pub async fn execute(args: Args) -> miette::Result<()> {
     }
 
     Ok(())
+}
+
+fn initialize_script(path: &std::path::Path, config: &Config) -> miette::Result<ScriptManifest> {
+    let channels = config
+        .default_channels()
+        .into_iter()
+        .map(|channel| channel.to_string())
+        .collect::<Vec<_>>();
+    let platforms = vec![Platform::current().to_string()];
+    Ok(ScriptManifest::initialize(path, &channels, &platforms)?)
+}
+
+fn add_lock_file_usage(
+    requested: LockFileUsage,
+    is_script: bool,
+    lock_file_exists: bool,
+) -> LockFileUsage {
+    if is_script && !lock_file_exists && requested == LockFileUsage::Update {
+        LockFileUsage::DryRun
+    } else {
+        requested
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn script_mode_accepts_conda_and_pypi_dependencies() {
+        let args = Args::try_parse_from(["add", "--script", "example.py", "python"]).unwrap();
+        assert_eq!(args.script, Some(PathBuf::from("example.py")));
+        assert!(!args.dependency_config.pypi);
+
+        let args =
+            Args::try_parse_from(["add", "--script", "example.py", "--pypi", "requests"]).unwrap();
+        assert!(args.dependency_config.pypi);
+    }
+
+    #[test]
+    fn script_mode_rejects_workspace_and_non_default_targets() {
+        for unsupported in [
+            ["--manifest-path", "pixi.toml"],
+            ["--feature", "test"],
+            ["--platform", "linux-64"],
+            ["--environment", "test"],
+        ] {
+            let mut argv = vec!["add", "--script", "example.py", "python"];
+            argv.extend(unsupported);
+            assert!(Args::try_parse_from(argv).is_err());
+        }
+    }
+
+    #[test]
+    fn an_absent_script_lock_is_solved_without_being_written() {
+        assert_eq!(
+            add_lock_file_usage(LockFileUsage::Update, true, false),
+            LockFileUsage::DryRun
+        );
+        assert_eq!(
+            add_lock_file_usage(LockFileUsage::Update, true, true),
+            LockFileUsage::Update
+        );
+        assert_eq!(
+            add_lock_file_usage(LockFileUsage::Update, false, false),
+            LockFileUsage::Update
+        );
+    }
 }

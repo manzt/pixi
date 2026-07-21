@@ -704,6 +704,48 @@ print("hello")
     assert not (tmp_pixi_workspace / ".pixi").exists()
 
 
+@pytest.mark.slow
+def test_add_script_initializes_and_adds_conda_dependency(
+    pixi: Path, tmp_pixi_workspace: Path
+) -> None:
+    script = tmp_pixi_workspace / "example.py"
+    script.write_text("print('hello')\n")
+
+    verify_cli_command(
+        [pixi, "add", "--script", script, "--no-install", "rich"],
+        cwd=tmp_pixi_workspace,
+    )
+    verify_cli_command(
+        [
+            pixi,
+            "add",
+            "--script",
+            script,
+            "--no-install",
+            "--pypi",
+            "requests==2.32.5",
+        ],
+        cwd=tmp_pixi_workspace,
+    )
+
+    contents = script.read_text()
+    lines = contents.splitlines()
+    opening = lines.index("# /// script")
+    closing = lines.index("# ///", opening + 1)
+    metadata = tomllib.loads(
+        "\n".join(
+            line.removeprefix("# ") if line != "#" else "" for line in lines[opening + 1 : closing]
+        )
+    )
+
+    assert contents.endswith("print('hello')\n")
+    assert metadata["dependencies"] == ["requests==2.32.5"]
+    assert metadata["tool"]["pixi"]["workspace"]["channels"] == [CONDA_FORGE_CHANNEL]
+    assert metadata["tool"]["pixi"]["workspace"]["platforms"] == [CURRENT_PLATFORM]
+    assert "rich" in metadata["tool"]["pixi"]["dependencies"]
+    assert not script.with_name("example.py.pixi.lock").exists()
+
+
 @pytest.mark.extra_slow
 def test_pixi_auth(pixi: Path, tmp_path: Path) -> None:
     # `pixi auth` delegates to rattler, whose only storage override is the

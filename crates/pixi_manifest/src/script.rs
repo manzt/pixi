@@ -103,6 +103,11 @@ impl ScriptManifest {
         Ok(self.metadata.parse()?)
     }
 
+    /// Present the script metadata as a pyproject document for Pixi's manifest editors.
+    pub fn pyproject_document(&self) -> Result<DocumentMut, ScriptManifestError> {
+        inline_pyproject(self.metadata(), script_name(&self.path)?)
+    }
+
     pub fn workspace_config(&self) -> Result<ScriptWorkspaceConfig, ScriptManifestError> {
         let metadata = self.metadata_document()?;
         let workspace = metadata
@@ -127,8 +132,7 @@ impl ScriptManifest {
             .path
             .parent()
             .expect("an absolute script path always has a parent");
-        let project_name = script_name(&self.path)?;
-        let pyproject = inline_pyproject(self.metadata(), project_name)?;
+        let pyproject = self.pyproject_document()?;
         let (workspace, package, warnings) =
             PyProjectManifest::from_toml_str(&pyproject.to_string())?
                 .into_workspace_manifest(root_directory)?;
@@ -147,6 +151,51 @@ impl ScriptManifest {
         );
         fs_err::write(&self.path, contents)?;
         Ok(())
+    }
+
+    /// Render changes made through a synthetic pyproject document back into the script.
+    pub fn render_pyproject_document(
+        &self,
+        pyproject: &DocumentMut,
+    ) -> Result<String, ScriptManifestError> {
+        let mut pyproject = pyproject.clone();
+        let mut project = pyproject
+            .remove("project")
+            .and_then(|item| item.into_table().ok())
+            .ok_or(ScriptManifestError::InvalidEditableDocument)?;
+        let dependencies = project
+            .remove("dependencies")
+            .unwrap_or_else(|| Item::Value(Value::Array(Array::new())));
+
+        let mut metadata = self.metadata_document()?;
+        metadata["dependencies"] = dependencies;
+        if let Some(requires_python) = project.remove("requires-python") {
+            metadata["requires-python"] = requires_python;
+        } else {
+            metadata.remove("requires-python");
+        }
+
+        let pixi = pyproject
+            .get_mut("tool")
+            .and_then(Item::as_table_like_mut)
+            .and_then(|tool| tool.remove("pixi"));
+        if let Some(pixi) = pixi {
+            if metadata.get("tool").is_none() {
+                metadata["tool"] = Item::Table(Table::new());
+            }
+            metadata
+                .get_mut("tool")
+                .and_then(Item::as_table_like_mut)
+                .expect("the tool table was just created or parsed")
+                .insert("pixi", pixi);
+        }
+
+        Ok(format!(
+            "{}{}{}",
+            self.prelude,
+            serialize_metadata(&metadata.to_string()),
+            self.postlude
+        ))
     }
 }
 
@@ -221,7 +270,11 @@ fn inline_pyproject(
         pyproject["project"]["requires-python"] = requires_python;
     }
     if let Some(pixi) = pixi {
-        pyproject["tool"]["pixi"] = pixi;
+        pyproject["tool"] = Item::Table(Table::new());
+        pyproject["tool"]
+            .as_table_mut()
+            .expect("the tool table was just created")
+            .insert("pixi", pixi);
     }
 
     ensure_pixi_workspace(&mut pyproject)?;
@@ -348,6 +401,9 @@ pub enum ScriptManifestError {
 
     #[error("`tool` must be a table")]
     InvalidToolTable,
+
+    #[error("the editable script document is missing its project table")]
+    InvalidEditableDocument,
 
     #[error("PEP 723 scripts do not support: {}", .0.join(", "))]
     #[diagnostic(help("A script represents one implicit default environment."))]
@@ -813,6 +869,73 @@ print("hello")
 # prerelease = "allow"
 # ///
 
+print("hello")
+"#
+        );
+    }
+
+    #[test]
+    fn metadata_edits_preserve_bom_crlf_and_missing_final_newline() {
+        let (_directory, path) = script(
+            "\u{feff}#!/usr/bin/env python\r\n# /// script\r\n# dependencies = []\r\n# ///\r\n\r\nprint('first')\r\nprint('last')",
+        );
+        let script = ScriptManifest::from_path(&path).unwrap().unwrap();
+        let mut pyproject = script.pyproject_document().unwrap();
+        pyproject["project"]["dependencies"]
+            .as_array_mut()
+            .unwrap()
+            .push("requests");
+
+        let contents = script.render_pyproject_document(&pyproject).unwrap();
+
+        assert!(contents.starts_with("\u{feff}#!/usr/bin/env python\r\n# /// script\n"));
+        assert!(contents.contains("# dependencies = [\"requests\"]\n"));
+        assert!(contents.ends_with("\r\nprint('first')\r\nprint('last')"));
+        assert!(!contents.ends_with('\n'));
+    }
+
+    #[test]
+    fn pyproject_edits_round_trip_through_script_metadata() {
+        let (_directory, path) = script(
+            r#"# /// script
+# requires-python = ">= 3.11"
+# dependencies = ["requests"]
+#
+# [tool.uv]
+# prerelease = "allow"
+#
+# [tool.pixi.workspace]
+# channels = ["conda-forge"]
+# platforms = ["linux-64"]
+# ///
+print("hello")
+"#,
+        );
+        let script = ScriptManifest::from_path(path).unwrap().unwrap();
+        let mut pyproject = script.pyproject_document().unwrap();
+        pyproject["project"]["dependencies"]
+            .as_array_mut()
+            .unwrap()
+            .push("rich");
+        pyproject["tool"]["pixi"]["dependencies"] = Item::Table(Table::new());
+        pyproject["tool"]["pixi"]["dependencies"]["python"] = value("*");
+
+        assert_eq!(
+            script.render_pyproject_document(&pyproject).unwrap(),
+            r#"# /// script
+# requires-python = ">= 3.11"
+# dependencies = ["requests", "rich"]
+#
+# [tool.uv]
+# prerelease = "allow"
+#
+# [tool.pixi.workspace]
+# channels = ["conda-forge"]
+# platforms = ["linux-64"]
+#
+# [tool.pixi.dependencies]
+# python = "*"
+# ///
 print("hello")
 "#
         );
