@@ -17,6 +17,12 @@ pub struct ScriptManifest {
     postlude: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ScriptWorkspaceConfig {
+    pub channels_explicit: bool,
+    pub platforms_explicit: bool,
+}
+
 impl ScriptManifest {
     /// Read the PEP 723 metadata block from a script.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Option<Self>, ScriptManifestError> {
@@ -44,6 +50,22 @@ impl ScriptManifest {
 
     pub fn metadata_document(&self) -> Result<DocumentMut, ScriptManifestError> {
         Ok(self.metadata.parse()?)
+    }
+
+    pub fn workspace_config(&self) -> Result<ScriptWorkspaceConfig, ScriptManifestError> {
+        let metadata = self.metadata_document()?;
+        let workspace = metadata
+            .get("tool")
+            .and_then(Item::as_table_like)
+            .and_then(|tool| tool.get("pixi"))
+            .and_then(Item::as_table_like)
+            .and_then(|pixi| pixi.get("workspace").or_else(|| pixi.get("project")))
+            .and_then(Item::as_table_like);
+
+        Ok(ScriptWorkspaceConfig {
+            channels_explicit: workspace.is_some_and(|table| table.contains_key("channels")),
+            platforms_explicit: workspace.is_some_and(|table| table.contains_key("platforms")),
+        })
     }
 
     /// Parse the inline metadata using the same semantics as `pyproject.toml`.
@@ -127,13 +149,18 @@ fn ensure_pixi_workspace(pyproject: &mut DocumentMut) -> Result<(), ScriptManife
     if pyproject["tool"].get("pixi").is_none() {
         pyproject["tool"]["pixi"] = Item::Table(Table::new());
     }
-    if pyproject["tool"]["pixi"].get("workspace").is_none() {
+    let workspace_key = if pyproject["tool"]["pixi"].get("workspace").is_some() {
+        "workspace"
+    } else if pyproject["tool"]["pixi"].get("project").is_some() {
+        "project"
+    } else {
         pyproject["tool"]["pixi"]["workspace"] = Item::Table(Table::new());
-    }
-    if !pyproject["tool"]["pixi"]["workspace"].is_table() {
+        "workspace"
+    };
+    if !pyproject["tool"]["pixi"][workspace_key].is_table() {
         return Err(ScriptManifestError::InvalidPixiWorkspace);
     }
-    let workspace = pyproject["tool"]["pixi"]["workspace"]
+    let workspace = pyproject["tool"]["pixi"][workspace_key]
         .as_table_mut()
         .expect("workspace was checked to be a table");
     for key in ["channels", "platforms"] {
@@ -493,6 +520,30 @@ print("hello")
         assert_eq!(manifest.workspace.name.as_deref(), Some("example"));
         assert_eq!(manifest.all_features().count(), 1);
         assert_eq!(manifest.environments.iter().count(), 1);
+    }
+
+    #[test]
+    fn preserves_the_pyproject_project_alias() {
+        let (_directory, path) = script(
+            r#"# /// script
+# dependencies = []
+#
+# [tool.pixi.project]
+# channels = ["conda-forge"]
+# platforms = ["linux-64"]
+# ///
+"#,
+        );
+
+        let script = ScriptManifest::from_path(path).unwrap().unwrap();
+        let config = script.workspace_config().unwrap();
+        assert!(config.channels_explicit);
+        assert!(config.platforms_explicit);
+        let (manifest, warnings) = script.into_workspace_manifest().unwrap();
+
+        assert_eq!(manifest.workspace.channels.len(), 1);
+        assert_eq!(manifest.workspace.platforms.len(), 1);
+        assert_eq!(warnings.len(), 1, "the existing alias remains deprecated");
     }
 
     #[test]
