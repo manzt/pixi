@@ -1,11 +1,15 @@
+use std::path::PathBuf;
+
 use clap::Parser;
 use miette::{Context, IntoDiagnostic};
+use pixi_config::Config;
 use pixi_core::{
-    WorkspaceLocator,
+    Workspace, WorkspaceLocator,
     environment::LockFileUsage,
     lock_file::{LockFileDerivedData, UpdateLockFileOptions},
 };
 use pixi_diff::{LockFileDiff, LockFileJsonDiff};
+use pixi_manifest::script::ScriptManifest;
 
 use crate::cli_config::NoInstallConfig;
 use crate::cli_config::WorkspaceConfig;
@@ -20,6 +24,14 @@ pub struct Args {
 
     #[clap(flatten)]
     pub workspace_config: WorkspaceConfig,
+
+    /// Lock a Python script using its inline PEP 723 metadata.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["manifest_path", "workspace"]
+    )]
+    pub script: Option<PathBuf>,
 
     #[clap(flatten)]
     pub config: pixi_config::ConfigCli,
@@ -43,11 +55,35 @@ pub struct Args {
 }
 
 pub async fn execute(args: Args) -> miette::Result<()> {
-    let mut workspace = WorkspaceLocator::for_cli()
-        .with_global_config_source(args.config_source.source())
-        .with_search_start(args.workspace_config.workspace_locator_start())
-        .locate()?
-        .with_cli_config(args.config.clone());
+    let mut workspace = if let Some(path) = &args.script {
+        let script = ScriptManifest::from_path(path)?.ok_or_else(|| {
+            miette::miette!(
+                help = format!(
+                    "Initialize it with `pixi init --script {}`.",
+                    path.display()
+                ),
+                "{} does not contain a PEP 723 metadata block",
+                path.display()
+            )
+        })?;
+        let root = script
+            .path()
+            .parent()
+            .expect("an absolute script path always has a parent");
+        let config = Config::load_with(root, &args.config_source.source())
+            .merge_config(args.config.clone().into());
+        let script_workspace = Workspace::from_script(script, config)?;
+        for warning in script_workspace.warnings {
+            tracing::warn!("{warning}");
+        }
+        script_workspace.value
+    } else {
+        WorkspaceLocator::for_cli()
+            .with_global_config_source(args.config_source.source())
+            .with_search_start(args.workspace_config.workspace_locator_start())
+            .locate()?
+            .with_cli_config(args.config.clone())
+    };
 
     // Apply backend override if provided (primarily for testing)
     if let Some(backend_override) = args.workspace_config.backend_override.clone() {
@@ -119,4 +155,34 @@ pub async fn execute(args: Args) -> miette::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn script_mode_is_explicit() {
+        let args = Args::try_parse_from(["lock", "--script", "example.py"]).unwrap();
+        assert_eq!(args.script, Some(PathBuf::from("example.py")));
+
+        assert!(Args::try_parse_from(["lock", "example.py"]).is_err());
+    }
+
+    #[test]
+    fn script_mode_rejects_workspace_selection() {
+        assert!(
+            Args::try_parse_from([
+                "lock",
+                "--script",
+                "example.py",
+                "--manifest-path",
+                "pixi.toml",
+            ])
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from(["lock", "--script", "example.py", "--workspace", "dev"]).is_err()
+        );
+    }
 }

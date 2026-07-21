@@ -650,6 +650,60 @@ def test_pixi_lock(pixi: Path, tmp_pixi_workspace: Path, dummy_channel_1: str) -
     assert not dot_pixi.exists()
 
 
+def test_lock_script_requires_inline_metadata(pixi: Path, tmp_pixi_workspace: Path) -> None:
+    script = tmp_pixi_workspace / "example.py"
+    script.write_text("print('hello')\n")
+
+    verify_cli_command(
+        [pixi, "lock", "--script", script],
+        ExitCode.FAILURE,
+        stderr_contains=["does not contain a PEP 723 metadata block", "pixi init --script"],
+    )
+
+    assert script.read_text() == "print('hello')\n"
+    assert not script.with_name("example.py.pixi.lock").exists()
+
+
+@pytest.mark.slow
+def test_lock_script_writes_only_its_adjacent_lock(pixi: Path, tmp_pixi_workspace: Path) -> None:
+    (tmp_pixi_workspace / "pixi.toml").write_text(
+        f'''[workspace]
+name = "enclosing"
+channels = []
+platforms = ["{CURRENT_PLATFORM}"]
+'''
+    )
+    script = tmp_pixi_workspace / "scripts" / "example.py"
+    script.parent.mkdir()
+    script.write_text(
+        f'''# /// script
+# requires-python = ">= 3.11"
+# dependencies = []
+#
+# [tool.pixi.workspace]
+# channels = ["{CONDA_FORGE_CHANNEL}"]
+# platforms = ["{CURRENT_PLATFORM}"]
+# ///
+print("hello")
+'''
+    )
+    original_script = script.read_text()
+    script_lock = script.with_name("example.py.pixi.lock")
+
+    verify_cli_command(
+        [pixi, "lock", "--script", script, "--dry-run"],
+        cwd=tmp_pixi_workspace,
+    )
+    assert script.read_text() == original_script
+    assert not script_lock.exists()
+
+    verify_cli_command([pixi, "lock", "--script", script], cwd=tmp_pixi_workspace)
+    assert script.read_text() == original_script
+    assert script_lock.exists()
+    assert not (tmp_pixi_workspace / "pixi.lock").exists()
+    assert not (tmp_pixi_workspace / ".pixi").exists()
+
+
 @pytest.mark.extra_slow
 def test_pixi_auth(pixi: Path, tmp_path: Path) -> None:
     # `pixi auth` delegates to rattler, whose only storage override is the
