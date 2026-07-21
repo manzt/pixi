@@ -746,6 +746,61 @@ def test_add_script_initializes_and_adds_conda_dependency(
     assert not script.with_name("example.py.pixi.lock").exists()
 
 
+def test_remove_script_requires_inline_metadata(pixi: Path, tmp_pixi_workspace: Path) -> None:
+    script = tmp_pixi_workspace / "example.py"
+    script.write_text("print('hello')\n")
+
+    verify_cli_command(
+        [pixi, "remove", "--script", script, "requests"],
+        ExitCode.FAILURE,
+        stderr_contains=["does not contain a PEP 723 metadata block", "pixi init --script"],
+    )
+    assert script.read_text() == "print('hello')\n"
+
+
+def test_remove_script_edits_metadata_without_creating_a_lock(
+    pixi: Path, tmp_pixi_workspace: Path
+) -> None:
+    script = tmp_pixi_workspace / "example.py"
+    script.write_text(
+        f'''# /// script
+# requires-python = ">= 3.11"
+# dependencies = ["requests==2.32.5"]
+#
+# [tool.uv]
+# prerelease = "allow"
+#
+# [tool.pixi.workspace]
+# channels = ["{CONDA_FORGE_CHANNEL}"]
+# platforms = ["{CURRENT_PLATFORM}"]
+#
+# [tool.pixi.dependencies]
+# rich = "*"
+# ///
+print("hello")
+'''
+    )
+
+    verify_cli_command([pixi, "remove", "--script", script, "rich"])
+    verify_cli_command([pixi, "remove", "--script", script, "--pypi", "requests"])
+
+    contents = script.read_text()
+    lines = contents.splitlines()
+    opening = lines.index("# /// script")
+    closing = lines.index("# ///", opening + 1)
+    metadata = tomllib.loads(
+        "\n".join(
+            line.removeprefix("# ") if line != "#" else "" for line in lines[opening + 1 : closing]
+        )
+    )
+
+    assert contents.endswith('print("hello")\n')
+    assert metadata["dependencies"] == []
+    assert metadata["tool"]["uv"] == {"prerelease": "allow"}
+    assert "rich" not in metadata["tool"]["pixi"].get("dependencies", {})
+    assert not script.with_name("example.py.pixi.lock").exists()
+
+
 @pytest.mark.extra_slow
 def test_pixi_auth(pixi: Path, tmp_path: Path) -> None:
     # `pixi auth` delegates to rattler, whose only storage override is the
