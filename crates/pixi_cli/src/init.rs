@@ -19,8 +19,15 @@ use crate::cli_interface::CliInterface;
 #[derive(Parser, Debug)]
 pub struct Args {
     /// Where to place the workspace (defaults to current path)
-    #[arg(default_value = ".")]
-    pub path: PathBuf,
+    #[arg(required_if_eq("script", "true"))]
+    pub path: Option<PathBuf>,
+
+    /// Initialize a Python script with inline metadata.
+    #[arg(
+        long,
+        conflicts_with_all = ["ENVIRONMENT_FILE", "format", "pyproject_toml", "scm", "conda_pypi_map"]
+    )]
+    pub script: bool,
 
     /// Channel to use in the workspace.
     #[arg(
@@ -119,7 +126,8 @@ impl From<Args> for InitOptions {
         });
 
         InitOptions {
-            path: args.path,
+            path: args.path.unwrap_or_else(|| PathBuf::from(".")),
+            script: args.script,
             channels: args.channels,
             platforms: args.platforms,
             env_file: args.env_file,
@@ -169,6 +177,17 @@ mod tests {
             let args = Args::try_parse_from(["init", "--format", input]).unwrap();
             assert_eq!(args.format, Some(expected));
         }
+    }
+
+    #[test]
+    fn script_initialization_requires_a_path() {
+        assert!(Args::try_parse_from(["init", "--script"]).is_err());
+        assert_eq!(
+            Args::try_parse_from(["init", "--script", "example.py"])
+                .unwrap()
+                .path,
+            Some(PathBuf::from("example.py"))
+        );
     }
 
     #[test]

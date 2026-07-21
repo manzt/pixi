@@ -14,7 +14,7 @@ use pixi_consts::consts;
 use pixi_core::{Workspace, workspace::WorkspaceMut};
 use pixi_manifest::{
     CondaPypiMap, CondaPypiMapEntry, CondaPypiMapSpec, CondaPypiMappingMode, FeatureName,
-    pyproject::PyProjectManifest,
+    pyproject::PyProjectManifest, script::ScriptManifest,
 };
 use pixi_utils::conda_environment_file::CondaEnvFile;
 use rattler_conda_types::{NamedChannelOrUrl, Platform};
@@ -76,6 +76,10 @@ fn build_render_context(dir: &Path, options: &InitOptions, config: &Config) -> R
 }
 
 pub async fn init<I: Interface>(interface: &I, options: InitOptions) -> miette::Result<Workspace> {
+    if options.script {
+        return init_script(interface, &options).await;
+    }
+
     // Fail silently if the directory already exists or cannot be created.
     fs_err::create_dir_all(&options.path).into_diagnostic()?;
     let dir = dunce::canonicalize(&options.path).into_diagnostic()?;
@@ -105,6 +109,32 @@ pub async fn init<I: Interface>(interface: &I, options: InitOptions) -> miette::
     create_scm_files(&options, &dir);
 
     Ok(workspace)
+}
+
+async fn init_script<I: Interface>(
+    interface: &I,
+    options: &InitOptions,
+) -> miette::Result<Workspace> {
+    let path = std::path::absolute(&options.path).into_diagnostic()?;
+    let parent = path
+        .parent()
+        .expect("an absolute script path always has a parent");
+    let config = Config::load(parent);
+    let channels = resolve_channels_from_options(options, &config)
+        .into_iter()
+        .map(|channel| channel.to_string())
+        .collect::<Vec<_>>();
+    let platforms = resolve_platforms(options);
+    let script = ScriptManifest::initialize(&path, &channels, &platforms)?;
+
+    interface
+        .success(&format!(
+            "Initialized script at {}",
+            script.path().display()
+        ))
+        .await;
+
+    Ok(Workspace::from_script(script, config)?.value)
 }
 
 async fn calculate_strategy<I: Interface>(
@@ -817,6 +847,65 @@ mod tests {
         pub _tmp_dir: tempfile::TempDir,
     }
 
+    #[tokio::test]
+    async fn initializes_a_standalone_script_with_resolved_workspace_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("scripts/example.py");
+        fs_err::create_dir_all(path.parent().unwrap()).unwrap();
+        fs_err::write(&path, "#!/usr/bin/env python\nprint('hello')\n").unwrap();
+        let options = InitOptions {
+            path: path.clone(),
+            script: true,
+            channels: Some(vec![NamedChannelOrUrl::Name("testing".into())]),
+            platforms: vec![Platform::current().to_string()],
+            env_file: None,
+            format: None,
+            scm: None,
+            conda_pypi_mapping: None,
+        };
+
+        let workspace = init(
+            &MockInterface {
+                confirm_response: false,
+            },
+            options,
+        )
+        .await
+        .unwrap();
+
+        let contents = fs_err::read_to_string(&path).unwrap();
+        assert!(contents.starts_with("#!/usr/bin/env python\n#\n# /// script\n"));
+        assert!(contents.contains("# requires-python = \">= 3.11\"\n"));
+        assert!(contents.contains("# channels = [\"testing\"]\n"));
+        assert!(contents.contains(&format!("# platforms = [\"{}\"]\n", Platform::current())));
+        assert!(contents.ends_with("\nprint('hello')\n"));
+        assert_eq!(workspace.root(), path.parent().unwrap());
+        assert_eq!(
+            workspace.lock_file_path(),
+            path.with_file_name("example.py.pixi.lock")
+        );
+        assert!(!directory.path().join(consts::WORKSPACE_MANIFEST).exists());
+        assert!(!directory.path().join(consts::PIXI_DIR).exists());
+
+        let second_init = init(
+            &MockInterface {
+                confirm_response: false,
+            },
+            InitOptions {
+                path,
+                script: true,
+                channels: None,
+                platforms: Vec::new(),
+                env_file: None,
+                format: None,
+                scm: None,
+                conda_pypi_mapping: None,
+            },
+        )
+        .await;
+        assert!(second_init.is_err());
+    }
+
     // Create TestOutcome function
     async fn run_init_scenario(config: TestConfig) -> TestOutcome {
         let tmp_dir = tempfile::tempdir().unwrap();
@@ -863,6 +952,7 @@ mod tests {
 
         let options = InitOptions {
             path: project_path.clone(),
+            script: false,
             env_file,
             format: config.format,
             channels: None,

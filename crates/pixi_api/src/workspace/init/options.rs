@@ -8,6 +8,10 @@ pub struct InitOptions {
     /// Where to place the workspace.
     pub path: PathBuf,
 
+    /// Initialize a Python script with inline metadata.
+    #[serde(default)]
+    pub script: bool,
+
     /// Channel to use in the workspace. Defaults to conda-forge when empty.
     pub channels: Option<Vec<NamedChannelOrUrl>>,
 

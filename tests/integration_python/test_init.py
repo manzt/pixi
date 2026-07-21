@@ -5,7 +5,7 @@ import pytest
 from dirty_equals import IsPartialDict
 from inline_snapshot import snapshot
 
-from .common import ExitCode, verify_cli_command
+from .common import CURRENT_PLATFORM, ExitCode, verify_cli_command
 
 
 def test_pixi_init_cwd(pixi: Path, tmp_pixi_workspace: Path) -> None:
@@ -35,6 +35,47 @@ def test_pixi_init_non_existing_dir(pixi: Path, tmp_pixi_workspace: Path) -> Non
     # Verify that the manifest file contains expected content
     manifest_content = manifest_path.read_text()
     assert "[workspace]" in manifest_content
+
+
+def test_pixi_init_script(pixi: Path, tmp_pixi_workspace: Path) -> None:
+    script = tmp_pixi_workspace / "scripts" / "example.py"
+    script.parent.mkdir()
+    script.write_text("#!/usr/bin/env python\nprint('hello')\n")
+
+    verify_cli_command(
+        [
+            pixi,
+            "init",
+            "--script",
+            script,
+            "--channel",
+            "testing",
+            "--platform",
+            CURRENT_PLATFORM,
+        ]
+    )
+
+    assert script.read_text() == f'''#!/usr/bin/env python
+#
+# /// script
+# requires-python = ">= 3.11"
+# dependencies = []
+#
+# [tool.pixi.workspace]
+# channels = ["testing"]
+# platforms = ["{CURRENT_PLATFORM}"]
+# ///
+
+print('hello')
+'''
+    assert not (tmp_pixi_workspace / "pixi.toml").exists()
+    assert not (tmp_pixi_workspace / ".pixi").exists()
+
+    verify_cli_command(
+        [pixi, "init", "--script", script],
+        ExitCode.FAILURE,
+        stderr_contains="already a PEP 723 script",
+    )
 
 
 def test_pixi_init_pixi_home_parent(pixi: Path, tmp_pixi_workspace: Path) -> None:
