@@ -26,7 +26,8 @@ use pixi_record::{
 use pixi_spec::{PixiSpec, SourceAnchor, SourceLocationSpec, SourceSpec, SpecConversionError};
 use pixi_uv_context::UvResolutionContext;
 use pixi_uv_conversions::{
-    as_uv_req, pep508_requirement_to_uv_requirement, to_normalize, to_uv_specifiers, to_uv_version,
+    as_uv_req, pep508_requirement_to_uv_requirement, to_normalize, to_uv_normalize,
+    to_uv_specifiers, to_uv_version,
 };
 use pypi_modifiers::pypi_marker_env::determine_marker_environment;
 use rattler_conda_types::{
@@ -36,9 +37,12 @@ use rattler_conda_types::{
 use rattler_lock::{LockedPackage, UrlOrPath};
 use uv_distribution_types::{RequirementSource, RequiresPython};
 
+use super::environment::{PypiWheelTagsCheck, SatisfiabilityMode};
 use super::errors::{LocalMetadataMismatch, PlatformUnsat, SolveGroupUnsat};
 use super::legacy;
-use super::pypi::{lock_pypi_packages, pypi_satisfies_editable, pypi_satisfies_requirement};
+use super::pypi::{
+    lock_pypi_packages, pypi_satisfies_editable, pypi_satisfies_requirement_with_index_policy,
+};
 use super::pypi_metadata;
 use super::source_record::{
     verify_immutable_record_identity, verify_partial_source_record_against_backend,
@@ -71,6 +75,8 @@ pub struct VerifySatisfiabilityContext<'a> {
     /// `find_unsatisfiable_targets` and shared across all per-platform
     /// contexts.
     pub resolver: &'a LockFileResolver,
+    /// Whether extra locked packages make the resolution out of date.
+    pub satisfiability: SatisfiabilityMode,
 }
 
 pub type PlatformSatisfiabilityResult = Result<
@@ -180,6 +186,15 @@ pub async fn verify_platform_satisfiability(
             return Err(err);
         }
     };
+    let pypi_wheel_tags_check = (ctx.satisfiability == SatisfiabilityMode::Sufficient)
+        .then(|| {
+            ctx.environment
+                .workspace_manifest()
+                .workspace
+                .platform_by_name(&ctx.platform)
+                .map(|platform| PypiWheelTagsCheck::new(platform, &locked_environment))
+        })
+        .flatten();
 
     // Convert the lock file into a list of conda and pypi packages.
     // Read as UnresolvedPixiRecord first, then resolve any partial source records.
@@ -207,6 +222,21 @@ pub async fn verify_platform_satisfiability(
                 pypi_packages.push(pypi.clone().into());
             }
         }
+    }
+
+    if ctx.satisfiability == SatisfiabilityMode::Sufficient {
+        let pixi_platform = ctx
+            .environment
+            .workspace_manifest()
+            .workspace
+            .platform_by_name(&ctx.platform);
+        (unresolved_records, pypi_packages) = retain_reachable_records(
+            ctx,
+            pixi_platform,
+            &platform_setup,
+            unresolved_records,
+            pypi_packages,
+        )?;
     }
 
     // Pre-v7 lock files don't store the resolved build/host
@@ -412,11 +442,417 @@ pub async fn verify_platform_satisfiability(
             &pypi_records_by_name,
             building_pixi_records,
             locked_environment.pypi_indexes(),
+            pypi_wheel_tags_check.as_ref(),
         )
         .await
     };
 
     package_verification_future.await
+}
+
+/// Remove records outside the manifest-reachable Conda/PyPI graph before any
+/// mutable source backend or local PyPI metadata is contacted.
+///
+/// The pre-pass intentionally mirrors the real verifier's conditions: Conda
+/// `when` clauses, requested extras, PyPI markers, and Conda packages that
+/// provide a reachable PyPI distribution. The retained graph is still fully
+/// checked by the normal verifier below; this pass only prevents surplus
+/// mutable records from causing work or failures.
+type RetainedLockedRecords = Result<
+    (Vec<UnresolvedPixiRecord>, Vec<UnresolvedPypiRecord>),
+    CommandDispatcherError<Box<PlatformUnsat>>,
+>;
+
+enum CondaReachabilityRequirement {
+    Exact {
+        name: PackageName,
+        extras: Vec<String>,
+        condition: Option<MatchSpecCondition>,
+    },
+    MatchSpec(Box<MatchSpec>),
+}
+
+fn retain_reachable_records(
+    ctx: &VerifySatisfiabilityContext<'_>,
+    pixi_platform: Option<&PixiPlatform>,
+    platform_setup: &crate::lock_file::platform_setup::PlatformSetup,
+    conda_records: Vec<UnresolvedPixiRecord>,
+    pypi_records: Vec<UnresolvedPypiRecord>,
+) -> RetainedLockedRecords {
+    let virtual_packages = platform_setup
+        .virtual_packages
+        .iter()
+        .cloned()
+        .map(|package| (package.name.clone(), package))
+        .collect::<HashMap<_, _>>();
+
+    let marker_environment = conda_records
+        .iter()
+        .find(|record| record.name().as_source() == "python")
+        .and_then(UnresolvedPixiRecord::package_record)
+        .zip(pixi_platform)
+        .map(|(python, platform)| determine_marker_environment(platform, python))
+        .transpose()
+        .map_err(|error| {
+            CommandDispatcherError::Failed(Box::new(
+                PlatformUnsat::FailedToDetermineMarkerEnvironment(error.into()),
+            ))
+        })?;
+
+    let providers = conda_pypi_providers(&conda_records);
+    let mut pending_pypi = Vec::new();
+    for (name, requirements) in ctx.environment.pypi_dependencies(pixi_platform) {
+        for requirement in requirements.iter() {
+            let requirement =
+                as_uv_req(requirement, name.as_source(), ctx.project_root).map_err(|error| {
+                    CommandDispatcherError::Failed(Box::new(PlatformUnsat::AsPep508Error(
+                        name.as_normalized().clone(),
+                        error,
+                    )))
+                })?;
+            if requirement.evaluate_markers(marker_environment.as_ref(), &requirement.extras) {
+                pending_pypi.push((requirement.name, requirement.extras.to_vec()));
+            }
+        }
+    }
+    let (retained_pypi, provider_roots) = retain_reachable_pypi_records_from_roots(
+        pypi_records,
+        pending_pypi,
+        marker_environment.as_ref(),
+        &providers,
+    );
+
+    let mut pending_conda = provider_roots
+        .into_iter()
+        .map(|(name, extras)| CondaReachabilityRequirement::Exact {
+            name,
+            extras,
+            condition: None,
+        })
+        .collect_vec();
+    let root_requirement = |name: PackageName,
+                            spec: PixiSpec|
+     -> Result<_, CommandDispatcherError<Box<PlatformUnsat>>> {
+        let (condition, extras) = match spec.into_source_or_binary() {
+            Either::Left(source) => (source.matchspec.condition, source.matchspec.extras),
+            Either::Right(binary) => {
+                let matchspec = binary
+                    .try_into_nameless_match_spec(&platform_setup.channel_config)
+                    .map_err(|error| {
+                        CommandDispatcherError::Failed(failed_to_parse_match_spec_unsat(
+                            name.as_source(),
+                            spec_conversion_to_match_spec_error(error),
+                        ))
+                    })?;
+                (matchspec.condition, matchspec.extras)
+            }
+        };
+        Ok(CondaReachabilityRequirement::Exact {
+            name,
+            extras: extras.unwrap_or_default(),
+            condition,
+        })
+    };
+    for (name, spec) in ctx
+        .environment
+        .combined_dependencies(pixi_platform)
+        .into_specs()
+    {
+        pending_conda.push(root_requirement(name, spec)?);
+    }
+    for (name, _) in ctx
+        .environment
+        .combined_dev_dependencies(pixi_platform)
+        .into_specs()
+    {
+        pending_conda.push(CondaReachabilityRequirement::Exact {
+            name,
+            extras: Vec::new(),
+            condition: None,
+        });
+    }
+
+    let retained_conda =
+        retain_reachable_conda_records(conda_records, pending_conda, &virtual_packages)?;
+    Ok((retained_conda, retained_pypi))
+}
+
+#[cfg(test)]
+fn retain_reachable_conda_records_from_roots(
+    records: Vec<UnresolvedPixiRecord>,
+    roots: Vec<(PackageName, Vec<String>)>,
+    virtual_packages: &HashMap<PackageName, GenericVirtualPackage>,
+) -> Result<Vec<UnresolvedPixiRecord>, CommandDispatcherError<Box<PlatformUnsat>>> {
+    retain_reachable_conda_records(
+        records,
+        roots
+            .into_iter()
+            .map(|(name, extras)| CondaReachabilityRequirement::Exact {
+                name,
+                extras,
+                condition: None,
+            })
+            .collect(),
+        virtual_packages,
+    )
+}
+
+fn retain_reachable_conda_records(
+    records: Vec<UnresolvedPixiRecord>,
+    mut pending: Vec<CondaReachabilityRequirement>,
+    virtual_packages: &HashMap<PackageName, GenericVirtualPackage>,
+) -> Result<Vec<UnresolvedPixiRecord>, CommandDispatcherError<Box<PlatformUnsat>>> {
+    let mut records_by_name: HashMap<PackageName, Vec<usize>> = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        records_by_name
+            .entry(record.name().clone())
+            .or_default()
+            .push(index);
+    }
+    let mut reachable = HashSet::new();
+    let mut followed_extras: HashMap<PackageName, HashSet<String>> = HashMap::new();
+
+    loop {
+        let mut made_progress = false;
+        let mut deferred = Vec::new();
+        while let Some(requirement) = pending.pop() {
+            let condition = match &requirement {
+                CondaReachabilityRequirement::Exact { condition, .. } => condition.as_ref(),
+                CondaReachabilityRequirement::MatchSpec(spec) => spec.condition.as_ref(),
+            };
+            if condition.is_some_and(|condition| {
+                !unresolved_condition_is_met(condition, &records, &reachable, virtual_packages)
+            }) {
+                deferred.push(requirement);
+                continue;
+            }
+
+            let targets = match requirement {
+                CondaReachabilityRequirement::Exact { name, extras, .. } => vec![(name, extras)],
+                CondaReachabilityRequirement::MatchSpec(spec) => {
+                    let (matcher, spec) = (*spec).into_nameless();
+                    let extras = spec.extras.unwrap_or_default();
+                    if let Some(name) = matcher.as_exact() {
+                        vec![(name.clone(), extras)]
+                    } else {
+                        records_by_name
+                            .keys()
+                            .filter(|name| matcher.matches(name))
+                            .cloned()
+                            .map(|name| (name, extras.clone()))
+                            .collect()
+                    }
+                }
+            };
+
+            for (name, extras) in targets {
+                let newly_reachable = reachable.insert(name.clone());
+                let followed = followed_extras.entry(name.clone()).or_default();
+                let new_extras = extras
+                    .into_iter()
+                    .filter(|extra| followed.insert(extra.clone()))
+                    .collect_vec();
+                if !newly_reachable && new_extras.is_empty() {
+                    continue;
+                }
+                made_progress = true;
+                let Some(indices) = records_by_name.get(&name) else {
+                    continue;
+                };
+                for index in indices {
+                    let record = &records[*index];
+                    let mut dependencies = if newly_reachable {
+                        record.depends().iter().collect_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    for extra in &new_extras {
+                        if let Some(extra_dependencies) = record
+                            .package_record()
+                            .and_then(|record| record.extra_depends.get(extra))
+                            .or_else(|| {
+                                record
+                                    .as_source()
+                                    .and_then(|record| record.data.as_partial())
+                                    .and_then(|record| record.experimental_extra_depends.get(extra))
+                            })
+                        {
+                            dependencies.extend(extra_dependencies);
+                        }
+                    }
+                    for dependency in dependencies {
+                        let spec = MatchSpec::from_str(
+                            dependency,
+                            ParseMatchSpecOptions::lenient()
+                                .with_repodata_revision(RepodataRevision::V3),
+                        )
+                        .map_err(|error| {
+                            CommandDispatcherError::Failed(Box::new(
+                                PlatformUnsat::FailedToParseMatchSpec(dependency.clone(), error),
+                            ))
+                        })?;
+                        pending.push(CondaReachabilityRequirement::MatchSpec(Box::new(spec)));
+                    }
+                }
+            }
+        }
+
+        if deferred.is_empty() || !made_progress {
+            break;
+        }
+        pending = deferred;
+    }
+
+    Ok(records
+        .into_iter()
+        .filter(|record| reachable.contains(record.name()))
+        .collect())
+}
+
+fn retain_reachable_pypi_records_from_roots(
+    records: Vec<UnresolvedPypiRecord>,
+    mut pending: Vec<(uv_normalize::PackageName, Vec<uv_normalize::ExtraName>)>,
+    marker_environment: Option<&uv_pep508::MarkerEnvironment>,
+    providers: &HashMap<uv_normalize::PackageName, PackageName>,
+) -> (Vec<UnresolvedPypiRecord>, Vec<(PackageName, Vec<String>)>) {
+    let mut records_by_name: HashMap<uv_normalize::PackageName, Vec<usize>> = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        if let Ok(name) = to_uv_normalize(record.as_package_data().name()) {
+            records_by_name.entry(name).or_default().push(index);
+        }
+    }
+
+    let mut reachable = HashSet::new();
+    let mut followed_extras: HashMap<uv_normalize::PackageName, HashSet<uv_normalize::ExtraName>> =
+        HashMap::new();
+    let mut provider_roots = Vec::new();
+    while let Some((name, extras)) = pending.pop() {
+        if let Some(provider) = providers.get(&name) {
+            provider_roots.push((provider.clone(), Vec::new()));
+            continue;
+        }
+
+        let followed = followed_extras.entry(name.clone()).or_default();
+        let had_base = reachable.contains(&name);
+        let mut changed = !had_base;
+        for extra in extras {
+            changed |= followed.insert(extra);
+        }
+        if !changed {
+            continue;
+        }
+        reachable.insert(name.clone());
+
+        let Some(indices) = records_by_name.get(&name) else {
+            continue;
+        };
+        let active_extras = followed.iter().cloned().collect_vec();
+        for index in indices {
+            for requirement in records[*index].as_package_data().requires_dist() {
+                let Ok(requirement) = pep508_requirement_to_uv_requirement(requirement.clone())
+                else {
+                    // The real traversal reports the conversion error after
+                    // the source record has been retained.
+                    continue;
+                };
+                if requirement.evaluate_markers(marker_environment, &active_extras) {
+                    pending.push((requirement.name, requirement.extras.to_vec()));
+                }
+            }
+        }
+    }
+
+    let retained = records
+        .into_iter()
+        .filter(|record| {
+            to_uv_normalize(record.as_package_data().name())
+                .map(|name| reachable.contains(&name))
+                .unwrap_or(true)
+        })
+        .collect();
+    (retained, provider_roots)
+}
+
+fn unresolved_condition_is_met(
+    condition: &MatchSpecCondition,
+    records: &[UnresolvedPixiRecord],
+    reachable: &HashSet<PackageName>,
+    virtual_packages: &HashMap<PackageName, GenericVirtualPackage>,
+) -> bool {
+    match condition {
+        MatchSpecCondition::MatchSpec(spec) => {
+            records.iter().any(|record| {
+                reachable.contains(record.name())
+                    && record
+                        .package_record()
+                        .is_some_and(|record| spec.matches(record))
+            }) || virtual_packages
+                .values()
+                .any(|package| package.matches(spec))
+        }
+        MatchSpecCondition::And(left, right) => {
+            unresolved_condition_is_met(left, records, reachable, virtual_packages)
+                && unresolved_condition_is_met(right, records, reachable, virtual_packages)
+        }
+        MatchSpecCondition::Or(left, right) => {
+            unresolved_condition_is_met(left, records, reachable, virtual_packages)
+                || unresolved_condition_is_met(right, records, reachable, virtual_packages)
+        }
+    }
+}
+
+fn conda_pypi_providers(
+    records: &[UnresolvedPixiRecord],
+) -> HashMap<uv_normalize::PackageName, PackageName> {
+    records
+        .iter()
+        .flat_map(|record| {
+            let names = match record {
+                UnresolvedPixiRecord::Binary(record) => {
+                    crate::lock_file::package_identifier::PypiPackageIdentifier::from_repodata_record(
+                        record,
+                    )
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|identifier| {
+                        to_uv_normalize(identifier.name.as_normalized()).ok()
+                    })
+                    .collect_vec()
+                }
+                UnresolvedPixiRecord::Source(record) => {
+                    if let Some(package_record) = record.data.as_full().map(|data| &data.package_record)
+                    {
+                        crate::lock_file::package_identifier::PypiPackageIdentifier::from_package_record(
+                            package_record,
+                        )
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|identifier| {
+                            to_uv_normalize(identifier.name.as_normalized()).ok()
+                        })
+                        .collect_vec()
+                    } else {
+                        record
+                            .data
+                            .as_partial()
+                            .and_then(|data| data.purls.as_ref())
+                            .into_iter()
+                            .flatten()
+                            .filter(|purl| purl.package_type() == "pypi")
+                            .filter_map(|purl| {
+                                pep508_rs::PackageName::from_str(purl.name())
+                                    .ok()
+                                    .and_then(|name| to_uv_normalize(&name).ok())
+                            })
+                            .collect_vec()
+                    }
+                }
+            };
+            names
+                .into_iter()
+                .map(|name| (name, record.name().clone()))
+        })
+        .collect()
 }
 
 /// Where a pypi requirement came from. The `index` semantics of a
@@ -623,6 +1059,7 @@ async fn verify_package_platform_satisfiability(
     unresolved_pypi_environment: &PypiRecordsByName,
     building_pixi_records: Result<PixiRecordsByName, PlatformUnsat>,
     locked_pypi_indexes: Option<&rattler_lock::PypiIndexes>,
+    pypi_wheel_tags_check: Option<&PypiWheelTagsCheck>,
 ) -> Result<
     (VerifiedIndividualEnvironment, LockedPypiRecordsByName),
     CommandDispatcherError<Box<PlatformUnsat>>,
@@ -731,7 +1168,10 @@ async fn verify_package_platform_satisfiability(
         .collect::<Result<Vec<_>, _>>()
         .map_err(CommandDispatcherError::Failed)?;
 
-    if pypi_requirements.is_empty() && !unresolved_pypi_environment.is_empty() {
+    if ctx.satisfiability == SatisfiabilityMode::Exact
+        && pypi_requirements.is_empty()
+        && !unresolved_pypi_environment.is_empty()
+    {
         return Err(CommandDispatcherError::Failed(Box::new(
             PlatformUnsat::TooManyPypiPackages(
                 unresolved_pypi_environment.names().cloned().collect(),
@@ -812,7 +1252,8 @@ async fn verify_package_platform_satisfiability(
     let (resolved_dev_dependencies, locked_pypi_records) =
         futures::try_join!(resolve_dev_dependencies_future, lock_pypi_packages_future)?;
 
-    if (environment_dependencies.is_empty() && resolved_dev_dependencies.is_empty())
+    if ctx.satisfiability == SatisfiabilityMode::Exact
+        && (environment_dependencies.is_empty() && resolved_dev_dependencies.is_empty())
         && !locked_pixi_records.is_empty()
     {
         return Err(CommandDispatcherError::Failed(Box::new(
@@ -988,6 +1429,14 @@ async fn verify_package_platform_satisfiability(
                         Ok(Some(idx)) => {
                             let record = &locked_pypi_records.records[idx];
 
+                            if let Some(check) = pypi_wheel_tags_check
+                                && let Some(wheel) = check.incompatible_wheel(&record.data)
+                            {
+                                delayed_pypi_error.get_or_insert_with(|| {
+                                    Box::new(PlatformUnsat::PypiWheelTagsMismatch { wheel })
+                                });
+                            }
+
                             // use the overridden requirements if specified
                             let requirement = dependency_overrides
                                 .get(&requirement.name)
@@ -1003,12 +1452,13 @@ async fn verify_package_platform_satisfiability(
 
                                 FoundPackage::PyPi(PypiPackageIdx(idx), requirement.extras.to_vec())
                             } else {
-                                if let Err(err) = pypi_satisfies_requirement(
+                                if let Err(err) = pypi_satisfies_requirement_with_index_policy(
                                     &requirement,
                                     record,
                                     ctx.project_root,
                                     origin,
                                     &locked_indexes,
+                                    ctx.satisfiability == SatisfiabilityMode::Exact,
                                 ) {
                                     delayed_pypi_error.get_or_insert(err);
                                 }
@@ -1243,7 +1693,9 @@ async fn verify_package_platform_satisfiability(
     }
 
     // Check if all locked packages have also been visited
-    if conda_packages_visited.len() != locked_pixi_records.len() {
+    if ctx.satisfiability == SatisfiabilityMode::Exact
+        && conda_packages_visited.len() != locked_pixi_records.len()
+    {
         return Err(CommandDispatcherError::Failed(Box::new(
             PlatformUnsat::TooManyCondaPackages(
                 locked_pixi_records
@@ -1264,12 +1716,14 @@ async fn verify_package_platform_satisfiability(
     // Check if all records that are source records should actually be source
     // records. If there are no source specs in the environment for a particular
     // package than the package must be a binary package.
-    for record in locked_pixi_records
-        .records
-        .iter()
-        .filter_map(PixiRecord::as_source)
-    {
-        if !expected_conda_source_dependencies.contains(record.name()) {
+    for (index, record) in locked_pixi_records.records.iter().enumerate() {
+        let Some(record) = record.as_source() else {
+            continue;
+        };
+        if !expected_conda_source_dependencies.contains(record.name())
+            && (ctx.satisfiability == SatisfiabilityMode::Exact
+                || conda_packages_visited.contains(&CondaPackageIdx(index)))
+        {
             return Err(CommandDispatcherError::Failed(Box::new(
                 PlatformUnsat::RequiredBinaryIsSource(record.name().as_source().to_string()),
             )));
@@ -1282,7 +1736,9 @@ async fn verify_package_platform_satisfiability(
         return Err(CommandDispatcherError::Failed(err));
     }
 
-    if pypi_packages_visited.len() != locked_pypi_records.len() {
+    if ctx.satisfiability == SatisfiabilityMode::Exact
+        && pypi_packages_visited.len() != locked_pypi_records.len()
+    {
         return Err(CommandDispatcherError::Failed(Box::new(
             PlatformUnsat::TooManyPypiPackages(
                 locked_pypi_records
@@ -1554,16 +2010,71 @@ pub fn verify_solve_group_satisfiability(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc};
 
-    use pixi_manifest::{PixiPlatform, WorkspaceManifest};
-    use rattler_conda_types::Platform;
+    use pixi_install_pypi::UnresolvedPypiRecord;
+    use pixi_manifest::{PixiPlatform, PixiPlatformName, WorkspaceManifest};
+    use pixi_record::{
+        PartialSourceRecordData, PinnedPathSpec, PinnedSourceSpec, SourceRecordData,
+        UnresolvedPixiRecord, UnresolvedSourceRecord,
+    };
+    use rattler_conda_types::{
+        PackageName, PackageRecord, PackageUrl, Platform, RepoDataRecord, VersionWithSource,
+    };
     use rattler_lock::{
         FindLinksUrlOrPath, LockFile, PlatformData, PlatformName, PypiIndexes, SolveOptions,
     };
     use url::Url;
 
-    use super::{collect_locked_indexes, resolve_lock_platform_for};
+    use super::{
+        collect_locked_indexes, conda_pypi_providers, resolve_lock_platform_for,
+        retain_reachable_conda_records_from_roots, retain_reachable_pypi_records_from_roots,
+    };
+    use crate::lock_file::tests::make_source_package_with;
+
+    fn conda_record(name: &str, depends: &[&str]) -> UnresolvedPixiRecord {
+        let mut package_record = PackageRecord::new(
+            PackageName::from_str(name).unwrap(),
+            VersionWithSource::from_str("1.0.0").unwrap(),
+            "h0".to_string(),
+        );
+        package_record.subdir = "linux-64".to_string();
+        package_record.depends = depends
+            .iter()
+            .map(|dependency| dependency.to_string())
+            .collect();
+        let file_name = format!("{name}-1.0.0-h0.conda");
+        UnresolvedPixiRecord::Binary(Arc::new(RepoDataRecord {
+            package_record,
+            identifier: file_name.parse().unwrap(),
+            url: Url::parse(&format!("https://example.invalid/{file_name}")).unwrap(),
+            channel: Some("https://example.invalid".to_string()),
+        }))
+    }
+
+    fn partial_conda_record(name: &str) -> UnresolvedPixiRecord {
+        UnresolvedPixiRecord::Source(Arc::new(UnresolvedSourceRecord {
+            data: SourceRecordData::Partial(PartialSourceRecordData {
+                name: PackageName::from_str(name).unwrap(),
+                depends: Vec::new(),
+                constrains: Vec::new(),
+                experimental_extra_depends: Default::default(),
+                flags: Default::default(),
+                purls: None,
+                license: None,
+                run_exports: None,
+                sources: Default::default(),
+            }),
+            manifest_source: PinnedSourceSpec::Path(PinnedPathSpec {
+                path: format!("./{name}").into(),
+            }),
+            build_source: None,
+            variants: Default::default(),
+            identifier_hash: String::new(),
+            build_packages: Vec::new(),
+            host_packages: Vec::new(),
+        }))
+    }
 
     fn manifest(source: &str) -> WorkspaceManifest {
         WorkspaceManifest::from_toml_str_with_base_dir(source, Path::new("")).unwrap()
@@ -1683,5 +2194,326 @@ mod tests {
 
         let collected = collect_locked_indexes(Some(&indexes));
         assert_eq!(collected, vec![&pypi_index, &find_links_url]);
+    }
+
+    #[test]
+    fn sufficient_conda_reachability_drops_surplus_records_before_validation() {
+        let records = vec![
+            conda_record("root", &["transitive >=1"]),
+            conda_record("transitive", &[]),
+            conda_record("surplus-source", &[]),
+        ];
+
+        let retained = retain_reachable_conda_records_from_roots(
+            records,
+            vec![(PackageName::from_str("root").unwrap(), Vec::new())],
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            retained
+                .iter()
+                .map(|record| record.name().as_source())
+                .collect::<Vec<_>>(),
+            ["root", "transitive"]
+        );
+    }
+
+    #[test]
+    fn sufficient_conda_reachability_honors_conditions_and_requested_extras() {
+        let mut root = conda_record("root", &["conditional *[when=\"python>=3.12\"]"]);
+        let UnresolvedPixiRecord::Binary(root_record) = &mut root else {
+            unreachable!()
+        };
+        Arc::make_mut(root_record)
+            .package_record
+            .extra_depends
+            .insert("feature".to_string(), vec!["optional >=1".to_string()]);
+        let records = vec![
+            root,
+            conda_record("conditional", &[]),
+            conda_record("optional", &[]),
+        ];
+
+        let without_extra = retain_reachable_conda_records_from_roots(
+            records.clone(),
+            vec![(PackageName::from_str("root").unwrap(), Vec::new())],
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            without_extra
+                .iter()
+                .map(|record| record.name().as_source())
+                .collect::<Vec<_>>(),
+            ["root"]
+        );
+
+        let with_extra = retain_reachable_conda_records_from_roots(
+            records,
+            vec![(
+                PackageName::from_str("root").unwrap(),
+                vec!["feature".to_string()],
+            )],
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            with_extra
+                .iter()
+                .map(|record| record.name().as_source())
+                .collect::<Vec<_>>(),
+            ["root", "optional"]
+        );
+    }
+
+    #[test]
+    fn sufficient_conda_conditions_use_only_reachable_witnesses() {
+        let records = vec![
+            conda_record("root", &["conditional *[when=\"surplus-witness>=1\"]"]),
+            conda_record("conditional", &[]),
+            conda_record("surplus-witness", &[]),
+        ];
+
+        let retained = retain_reachable_conda_records_from_roots(
+            records,
+            vec![(PackageName::from_str("root").unwrap(), Vec::new())],
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            retained
+                .iter()
+                .map(|record| record.name().as_source())
+                .collect::<Vec<_>>(),
+            ["root"]
+        );
+    }
+
+    #[test]
+    fn sufficient_conda_conditions_reach_a_fixed_point() {
+        // The conditional edge is popped before its witness, so a single-pass
+        // traversal would incorrectly drop it. Once the unconditional witness
+        // becomes reachable, the deferred edge must be followed.
+        let records = vec![
+            conda_record(
+                "root",
+                &["witness >=1", "conditional *[when=\"witness>=1\"]"],
+            ),
+            conda_record("conditional", &[]),
+            conda_record("witness", &[]),
+        ];
+
+        let retained = retain_reachable_conda_records_from_roots(
+            records,
+            vec![(PackageName::from_str("root").unwrap(), Vec::new())],
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            retained
+                .iter()
+                .map(|record| record.name().as_source())
+                .collect::<Vec<_>>(),
+            ["root", "conditional", "witness"]
+        );
+    }
+
+    #[test]
+    fn sufficient_conda_conditions_do_not_use_partial_source_versions() {
+        let records = vec![
+            conda_record(
+                "root",
+                &["witness >=1", "conditional *[when=\"witness>=2\"]"],
+            ),
+            partial_conda_record("witness"),
+            conda_record("conditional", &[]),
+        ];
+
+        let retained = retain_reachable_conda_records_from_roots(
+            records,
+            vec![(PackageName::from_str("root").unwrap(), Vec::new())],
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            retained
+                .iter()
+                .map(|record| record.name().as_source())
+                .collect::<Vec<_>>(),
+            ["root", "witness"]
+        );
+    }
+
+    #[test]
+    fn sufficient_pypi_reachability_drops_surplus_sources_before_metadata() {
+        let root_requirement = pep508_rs::Requirement::from_str("transitive>=1").unwrap();
+        let records = vec![
+            UnresolvedPypiRecord::from(make_source_package_with(
+                "root",
+                rattler_lock::Verbatim::new(rattler_lock::UrlOrPath::Path("./root".into())),
+                vec![root_requirement],
+                None,
+            )),
+            UnresolvedPypiRecord::from(make_source_package_with(
+                "transitive",
+                rattler_lock::Verbatim::new(rattler_lock::UrlOrPath::Path("./transitive".into())),
+                vec![],
+                None,
+            )),
+            UnresolvedPypiRecord::from(make_source_package_with(
+                "surplus-source",
+                rattler_lock::Verbatim::new(rattler_lock::UrlOrPath::Path(
+                    "./surplus-source".into(),
+                )),
+                vec![],
+                None,
+            )),
+        ];
+
+        let retained = retain_reachable_pypi_records_from_roots(
+            records,
+            vec![(
+                uv_normalize::PackageName::from_str("root").unwrap(),
+                Vec::new(),
+            )],
+            None,
+            &HashMap::new(),
+        )
+        .0;
+        assert_eq!(
+            retained
+                .iter()
+                .map(|record| record.as_package_data().name().as_ref())
+                .collect::<Vec<_>>(),
+            ["root", "transitive"]
+        );
+    }
+
+    #[test]
+    fn sufficient_pypi_reachability_honors_extras_and_platform_markers() {
+        let requirements = vec![
+            pep508_rs::Requirement::from_str("extra-source; extra == 'feature'").unwrap(),
+            pep508_rs::Requirement::from_str("windows-source; sys_platform == 'win32'").unwrap(),
+        ];
+        let records = vec![
+            UnresolvedPypiRecord::from(make_source_package_with(
+                "root",
+                rattler_lock::Verbatim::new(rattler_lock::UrlOrPath::Path("./root".into())),
+                requirements,
+                None,
+            )),
+            UnresolvedPypiRecord::from(make_source_package_with(
+                "extra-source",
+                rattler_lock::Verbatim::new(rattler_lock::UrlOrPath::Path("./extra-source".into())),
+                vec![],
+                None,
+            )),
+            UnresolvedPypiRecord::from(make_source_package_with(
+                "windows-source",
+                rattler_lock::Verbatim::new(rattler_lock::UrlOrPath::Path(
+                    "./windows-source".into(),
+                )),
+                vec![],
+                None,
+            )),
+        ];
+        let platform = PixiPlatform::new(
+            PixiPlatformName::try_from("linux-test").unwrap(),
+            Platform::Linux64,
+            vec![],
+        )
+        .unwrap();
+        let mut python = PackageRecord::new(
+            PackageName::from_str("python").unwrap(),
+            VersionWithSource::from_str("3.12.0").unwrap(),
+            "h0".to_string(),
+        );
+        python.subdir = "linux-64".to_string();
+        let marker_environment =
+            pypi_modifiers::pypi_marker_env::determine_marker_environment(&platform, &python)
+                .unwrap();
+
+        let without_extra = retain_reachable_pypi_records_from_roots(
+            records.clone(),
+            vec![(
+                uv_normalize::PackageName::from_str("root").unwrap(),
+                Vec::new(),
+            )],
+            Some(&marker_environment),
+            &HashMap::new(),
+        )
+        .0;
+        assert_eq!(
+            without_extra
+                .iter()
+                .map(|record| record.as_package_data().name().as_ref())
+                .collect::<Vec<_>>(),
+            ["root"]
+        );
+
+        let with_extra = retain_reachable_pypi_records_from_roots(
+            records,
+            vec![(
+                uv_normalize::PackageName::from_str("root").unwrap(),
+                vec![uv_normalize::ExtraName::from_str("feature").unwrap()],
+            )],
+            Some(&marker_environment),
+            &HashMap::new(),
+        )
+        .0;
+        assert_eq!(
+            with_extra
+                .iter()
+                .map(|record| record.as_package_data().name().as_ref())
+                .collect::<Vec<_>>(),
+            ["root", "extra-source"]
+        );
+    }
+
+    #[test]
+    fn sufficient_pypi_root_retains_only_its_conda_provider() {
+        let mut provider = conda_record("provider", &[]);
+        let UnresolvedPixiRecord::Binary(provider_record) = &mut provider else {
+            unreachable!()
+        };
+        Arc::make_mut(provider_record).package_record.purls = Some(
+            [PackageUrl::from_str("pkg:pypi/demo@1.0.0").unwrap()]
+                .into_iter()
+                .collect(),
+        );
+        let conda_records = vec![provider, conda_record("surplus-source", &[])];
+        let providers = conda_pypi_providers(&conda_records);
+        let pypi_records = vec![UnresolvedPypiRecord::from(make_source_package_with(
+            "demo",
+            rattler_lock::Verbatim::new(rattler_lock::UrlOrPath::Path("./demo".into())),
+            vec![],
+            None,
+        ))];
+
+        let (retained_pypi, provider_roots) = retain_reachable_pypi_records_from_roots(
+            pypi_records,
+            vec![(
+                uv_normalize::PackageName::from_str("demo").unwrap(),
+                Vec::new(),
+            )],
+            None,
+            &providers,
+        );
+        assert!(retained_pypi.is_empty());
+
+        let retained_conda = retain_reachable_conda_records_from_roots(
+            conda_records,
+            provider_roots,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            retained_conda
+                .iter()
+                .map(|record| record.name().as_source())
+                .collect::<Vec<_>>(),
+            ["provider"]
+        );
     }
 }

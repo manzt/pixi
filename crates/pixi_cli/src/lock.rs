@@ -76,6 +76,7 @@ pub async fn execute(args: Args) -> miette::Result<()> {
                 no_install: args.no_install_config.no_install || args.dry_run,
                 upgrade_lock_file_format: true,
                 max_concurrent_solves: workspace.config().max_concurrent_solves(),
+                ..Default::default()
             },
         )
         .await?;

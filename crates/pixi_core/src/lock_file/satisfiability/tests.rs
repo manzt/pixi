@@ -33,9 +33,9 @@ use thiserror::Error;
 use tracing_test::traced_test;
 
 use super::{
-    EnvironmentUnsat, PlatformUnsat, SolveGroupUnsat, VerifySatisfiabilityContext, pypi_metadata,
-    verify_environment_satisfiability, verify_platform_satisfiability,
-    verify_solve_group_satisfiability,
+    EnvironmentUnsat, PlatformUnsat, SatisfiabilityMode, SolveGroupUnsat,
+    VerifySatisfiabilityContext, pypi_metadata, verify_environment_satisfiability_with_mode,
+    verify_platform_satisfiability, verify_solve_group_satisfiability,
 };
 use crate::{
     Workspace,
@@ -71,6 +71,21 @@ async fn verify_lock_file_satisfiability(
     project: &Workspace,
     lock_file: &LockFile,
     backend_override: Option<BackendOverride>,
+) -> Result<(), LockfileUnsat> {
+    verify_lock_file_satisfiability_with_mode(
+        project,
+        lock_file,
+        backend_override,
+        SatisfiabilityMode::Exact,
+    )
+    .await
+}
+
+async fn verify_lock_file_satisfiability_with_mode(
+    project: &Workspace,
+    lock_file: &LockFile,
+    backend_override: Option<BackendOverride>,
+    satisfiability: SatisfiabilityMode,
 ) -> Result<(), LockfileUnsat> {
     // Ensure the rayon thread pool is initialized before any code path
     // that might trigger implicit rayon initialization (e.g. uv's
@@ -135,7 +150,7 @@ async fn verify_lock_file_satisfiability(
         let locked_env = lock_file
             .environment(env.name().as_str())
             .ok_or_else(|| LockfileUnsat::EnvironmentMissing(env.name().to_string()))?;
-        verify_environment_satisfiability(&env, locked_env)
+        verify_environment_satisfiability_with_mode(&env, locked_env, satisfiability)
             .map_err(|e| LockfileUnsat::Environment(env.name().to_string(), e))?;
 
         for platform in env.platforms() {
@@ -150,6 +165,7 @@ async fn verify_lock_file_satisfiability(
                 build_caches: &build_caches,
                 static_metadata_cache: &static_metadata_cache,
                 resolver: &resolver,
+                satisfiability,
             };
             let (verified_env, _locked_pypi) = verify_platform_satisfiability(&ctx, locked_env)
                 .await
@@ -262,6 +278,346 @@ async fn test_failing_satisfiability(
         // run snapshot test here
         insta::assert_snapshot!(s);
     });
+}
+
+fn non_satisfiability_fixture(name: &str) -> (Workspace, LockFile) {
+    fixture_with_manifest("non-satisfiability", name, None)
+}
+
+fn fixture_with_manifest(
+    category: &str,
+    name: &str,
+    manifest: Option<&str>,
+) -> (Workspace, LockFile) {
+    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/data")
+        .join(category)
+        .join(name);
+    let manifest_path = fixture_path.join("pixi.toml");
+    let project = if let Some(manifest) = manifest {
+        Workspace::from_str(&manifest_path, manifest).unwrap()
+    } else {
+        Workspace::from_path(&manifest_path).unwrap()
+    };
+    let lock_file = LockFile::from_path(&fixture_path.join("pixi.lock")).unwrap();
+    (project, lock_file)
+}
+
+fn passthrough_backend() -> Option<BackendOverride> {
+    Some(BackendOverride::from_memory(
+        PassthroughBackend::instantiator(),
+    ))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExpectedExactPolicyFailure {
+    SolveStrategy,
+    ChannelPriority,
+    ExcludeNewer,
+    PypiPrerelease,
+    NoBuild,
+    AdditionalPlatforms,
+}
+
+#[rstest]
+#[case("mismatch-solve-strategy", ExpectedExactPolicyFailure::SolveStrategy)]
+#[case(
+    "mismatch-channel-priority",
+    ExpectedExactPolicyFailure::ChannelPriority
+)]
+#[case("mismatch-exclude-newer", ExpectedExactPolicyFailure::ExcludeNewer)]
+#[case(
+    "mismatch-pypi-prerelease-mode",
+    ExpectedExactPolicyFailure::PypiPrerelease
+)]
+#[case("non-binary-no-build", ExpectedExactPolicyFailure::NoBuild)]
+#[case("too-many-platforms", ExpectedExactPolicyFailure::AdditionalPlatforms)]
+fn sufficient_environment_satisfiability_accepts_resolution_policy_differences(
+    #[case] fixture: &str,
+    #[case] expected: ExpectedExactPolicyFailure,
+) {
+    let (project, lock_file) = non_satisfiability_fixture(fixture);
+    let environment = project.default_environment();
+    let locked_environment = lock_file.environment("default").unwrap();
+
+    let exact_error = verify_environment_satisfiability_with_mode(
+        &environment,
+        locked_environment,
+        SatisfiabilityMode::Exact,
+    )
+    .expect_err("the fixture must differ under exact lock-file semantics");
+    let matches_expected_variant = matches!(
+        (expected, &exact_error),
+        (
+            ExpectedExactPolicyFailure::SolveStrategy,
+            EnvironmentUnsat::SolveStrategyMismatch { .. }
+        ) | (
+            ExpectedExactPolicyFailure::ChannelPriority,
+            EnvironmentUnsat::ChannelPriorityMismatch { .. }
+        ) | (
+            ExpectedExactPolicyFailure::ExcludeNewer,
+            EnvironmentUnsat::ExcludeNewerMismatch(_)
+        ) | (
+            ExpectedExactPolicyFailure::PypiPrerelease,
+            EnvironmentUnsat::PypiPrereleaseModeMismatch { .. }
+        ) | (
+            ExpectedExactPolicyFailure::NoBuild,
+            EnvironmentUnsat::NoBuildWithNonBinaryPackages(_)
+        ) | (
+            ExpectedExactPolicyFailure::AdditionalPlatforms,
+            EnvironmentUnsat::AdditionalPlatformsInLockFile(_)
+        )
+    );
+    assert!(
+        matches_expected_variant,
+        "{fixture} did not isolate the intended exact-policy failure: {exact_error:?}"
+    );
+
+    verify_environment_satisfiability_with_mode(
+        &environment,
+        locked_environment,
+        SatisfiabilityMode::Sufficient,
+    )
+    .unwrap_or_else(|error| panic!("{fixture} should remain a sufficient solution: {error:?}"));
+}
+
+#[tokio::test]
+async fn sufficient_satisfiability_does_not_require_pypi_index_provenance() {
+    let fixture = "pypi-index-mismatch";
+    let (project, lock_file) = non_satisfiability_fixture(fixture);
+
+    let exact_error = verify_lock_file_satisfiability_with_mode(
+        &project,
+        &lock_file,
+        passthrough_backend(),
+        SatisfiabilityMode::Exact,
+    )
+    .await
+    .expect_err("the fixture must differ under exact lock-file semantics");
+    assert!(
+        matches!(
+            exact_error,
+            LockfileUnsat::PlatformUnsat(_, _, PlatformUnsat::LockedPyPIIndexMismatch { .. })
+        ),
+        "the fixture did not isolate the intended index mismatch: {exact_error:?}"
+    );
+
+    verify_lock_file_satisfiability_with_mode(
+        &project,
+        &lock_file,
+        passthrough_backend(),
+        SatisfiabilityMode::Sufficient,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{fixture} should remain a sufficient solution: {error:?}"));
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExpectedSufficientFailure {
+    MatchSpec,
+    SourceSpec,
+    PlatformDefinition,
+    WheelTags,
+}
+
+#[rstest]
+#[case("mismatched-spec", ExpectedSufficientFailure::MatchSpec)]
+#[case("missing-dependency", ExpectedSufficientFailure::MatchSpec)]
+#[case("mismatched-source-spec", ExpectedSufficientFailure::SourceSpec)]
+#[case(
+    "changed-platform-subdir",
+    ExpectedSufficientFailure::PlatformDefinition
+)]
+#[case(
+    "changed-platform-virtual-package",
+    ExpectedSufficientFailure::PlatformDefinition
+)]
+#[case("wheels-with-wrong-tags", ExpectedSufficientFailure::WheelTags)]
+#[tokio::test]
+async fn sufficient_satisfiability_rejects_real_incompatibilities(
+    #[case] fixture: &str,
+    #[case] expected: ExpectedSufficientFailure,
+) {
+    let (project, lock_file) = non_satisfiability_fixture(fixture);
+    let error = verify_lock_file_satisfiability_with_mode(
+        &project,
+        &lock_file,
+        passthrough_backend(),
+        SatisfiabilityMode::Sufficient,
+    )
+    .await
+    .expect_err("a real incompatibility must not be accepted as sufficient");
+
+    let matches_expected_variant = matches!(
+        (expected, &error),
+        (
+            ExpectedSufficientFailure::MatchSpec,
+            LockfileUnsat::PlatformUnsat(_, _, PlatformUnsat::UnsatisfiableMatchSpec(_, _))
+        ) | (
+            ExpectedSufficientFailure::SourceSpec,
+            LockfileUnsat::PlatformUnsat(_, _, PlatformUnsat::SourcePackageMismatch(_, _))
+        ) | (
+            ExpectedSufficientFailure::PlatformDefinition,
+            LockfileUnsat::Environment(_, EnvironmentUnsat::PlatformDefinitionChanged(_))
+        ) | (
+            ExpectedSufficientFailure::WheelTags,
+            LockfileUnsat::PlatformUnsat(_, _, PlatformUnsat::PypiWheelTagsMismatch { .. })
+        )
+    );
+    assert!(
+        matches_expected_variant,
+        "{fixture} failed with the wrong incompatibility: {error:?}"
+    );
+}
+
+#[test]
+fn sufficient_environment_satisfiability_accepts_changed_channels() {
+    let manifest = r#"
+[workspace]
+channels = ["https://example.invalid/channel"]
+name = "changed-channel"
+platforms = ["linux-64"]
+"#;
+    let (project, lock_file) =
+        fixture_with_manifest("satisfiability", "wheel-with-correct-tags", Some(manifest));
+    let environment = project.default_environment();
+    let locked_environment = lock_file.environment("default").unwrap();
+
+    assert!(matches!(
+        verify_environment_satisfiability_with_mode(
+            &environment,
+            locked_environment,
+            SatisfiabilityMode::Exact,
+        ),
+        Err(EnvironmentUnsat::ChannelsMismatch)
+    ));
+    verify_environment_satisfiability_with_mode(
+        &environment,
+        locked_environment,
+        SatisfiabilityMode::Sufficient,
+    )
+    .expect("channel policy must not invalidate a compatible installed solution");
+}
+
+#[test]
+fn sufficient_environment_satisfiability_accepts_changed_pypi_indexes() {
+    let manifest = r#"
+[workspace]
+channels = ["conda-forge"]
+name = "changed-index"
+platforms = ["win-64"]
+
+[workspace.pypi-options]
+index-url = "https://different.example.com/simple"
+
+[dependencies]
+python = "3.12.*"
+
+[pypi-dependencies]
+my-dep = ">=1.0"
+"#;
+    let (project, lock_file) =
+        fixture_with_manifest("satisfiability", "pypi-index-match", Some(manifest));
+    let environment = project.default_environment();
+    let locked_environment = lock_file.environment("default").unwrap();
+
+    assert!(matches!(
+        verify_environment_satisfiability_with_mode(
+            &environment,
+            locked_environment,
+            SatisfiabilityMode::Exact,
+        ),
+        Err(EnvironmentUnsat::IndexesMismatch(_))
+    ));
+    verify_environment_satisfiability_with_mode(
+        &environment,
+        locked_environment,
+        SatisfiabilityMode::Sufficient,
+    )
+    .expect("index policy must not invalidate a compatible installed solution");
+}
+
+#[tokio::test]
+async fn sufficient_satisfiability_accepts_a_fully_surplus_resolution() {
+    let manifest = r#"
+[workspace]
+channels = ["conda-forge"]
+name = "empty-script"
+platforms = ["linux-64"]
+"#;
+    let (project, lock_file) = fixture_with_manifest(
+        "non-satisfiability",
+        "wheels-with-wrong-tags",
+        Some(manifest),
+    );
+
+    let exact_error = verify_lock_file_satisfiability_with_mode(
+        &project,
+        &lock_file,
+        passthrough_backend(),
+        SatisfiabilityMode::Exact,
+    )
+    .await
+    .expect_err("exact validation must reject surplus packages");
+    assert!(matches!(
+        exact_error,
+        LockfileUnsat::PlatformUnsat(_, _, PlatformUnsat::TooManyPypiPackages(_))
+    ));
+
+    verify_lock_file_satisfiability_with_mode(
+        &project,
+        &lock_file,
+        passthrough_backend(),
+        SatisfiabilityMode::Sufficient,
+    )
+    .await
+    .expect("a fully surplus installed resolution remains sufficient");
+}
+
+#[tokio::test]
+async fn sufficient_satisfiability_ignores_tags_on_a_surplus_wheel() {
+    let manifest = r#"
+[workspace]
+channels = ["conda-forge"]
+name = "reduced-script"
+platforms = ["linux-64"]
+
+[dependencies]
+python = ">=3.14.2,<3.15"
+
+[pypi-dependencies]
+cffi = "==2.0.0"
+
+[system-requirements]
+libc = "2.17"
+"#;
+    let (project, lock_file) = fixture_with_manifest(
+        "non-satisfiability",
+        "wheels-with-wrong-tags",
+        Some(manifest),
+    );
+
+    let exact_error = verify_lock_file_satisfiability_with_mode(
+        &project,
+        &lock_file,
+        passthrough_backend(),
+        SatisfiabilityMode::Exact,
+    )
+    .await
+    .expect_err("exact validation must inspect the surplus wheel");
+    assert!(matches!(
+        exact_error,
+        LockfileUnsat::Environment(_, EnvironmentUnsat::PypiWheelTagsMismatch { .. })
+    ));
+
+    verify_lock_file_satisfiability_with_mode(
+        &project,
+        &lock_file,
+        passthrough_backend(),
+        SatisfiabilityMode::Sufficient,
+    )
+    .await
+    .expect("wheel tags on an unreachable surplus package are irrelevant");
 }
 
 #[test]

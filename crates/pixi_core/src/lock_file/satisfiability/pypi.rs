@@ -130,12 +130,35 @@ pub(crate) fn pypi_satisfies_editable(
 /// (already verified against the manifest); a requirement with no
 /// per-package `index` is satisfied by any of them. Empty slice falls back
 /// to the default PyPI URL (pre-v7 lock files).
+#[cfg(test)]
 pub(crate) fn pypi_satisfies_requirement(
     spec: &uv_distribution_types::Requirement,
     locked_record: &LockedPypiRecord,
     project_root: &Path,
     origin: RequirementOrigin,
     locked_indexes: &[&Url],
+) -> Result<(), Box<PlatformUnsat>> {
+    pypi_satisfies_requirement_with_index_policy(
+        spec,
+        locked_record,
+        project_root,
+        origin,
+        locked_indexes,
+        true,
+    )
+}
+
+/// Check a PyPI requirement, with control over whether registry provenance is
+/// part of satisfiability. A cached script environment only needs the locked
+/// artifact to satisfy the requirement; index policy is an input to future
+/// resolution, not a property of the installed artifact.
+pub(crate) fn pypi_satisfies_requirement_with_index_policy(
+    spec: &uv_distribution_types::Requirement,
+    locked_record: &LockedPypiRecord,
+    project_root: &Path,
+    origin: RequirementOrigin,
+    locked_indexes: &[&Url],
+    verify_index: bool,
 ) -> Result<(), Box<PlatformUnsat>> {
     let locked_data = &locked_record.data;
     if spec.name.to_string() != locked_data.name().to_string() {
@@ -182,47 +205,49 @@ pub(crate) fn pypi_satisfies_requirement(
             // Verify the index in the requirement matches the lock file.
             // Pre-v7 lock files don't store per-package index URLs, so
             // index_url is None — skip the comparison in that case.
-            match (
-                index,
-                locked_data.as_wheel().and_then(|w| w.index_url.as_ref()),
-            ) {
-                (Some(required_index), Some(locked_url)) => {
-                    let required_url: Url = required_index.url.url().clone().into();
-                    if locked_url != &required_url {
-                        return Err(PlatformUnsat::LockedPyPIIndexMismatch {
-                            name: spec.name.to_string(),
-                            expected_index: required_url.to_string(),
-                            locked_index: locked_url.to_string(),
+            if verify_index {
+                match (
+                    index,
+                    locked_data.as_wheel().and_then(|w| w.index_url.as_ref()),
+                ) {
+                    (Some(required_index), Some(locked_url)) => {
+                        let required_url: Url = required_index.url.url().clone().into();
+                        if locked_url != &required_url {
+                            return Err(PlatformUnsat::LockedPyPIIndexMismatch {
+                                name: spec.name.to_string(),
+                                expected_index: required_url.to_string(),
+                                locked_index: locked_url.to_string(),
+                            }
+                            .into());
                         }
-                        .into());
                     }
-                }
-                (None, Some(locked_url)) if origin == RequirementOrigin::Manifest => {
-                    // Issue #6060: accept the locked URL if it matches any
-                    // env-level configured index; fall back to PyPI default.
-                    let default_index = &*pixi_consts::consts::DEFAULT_PYPI_INDEX_URL;
-                    let effective_indexes: &[&Url] = if locked_indexes.is_empty() {
-                        std::slice::from_ref(&default_index)
-                    } else {
-                        locked_indexes
-                    };
-                    let acceptable = effective_indexes
-                        .iter()
-                        .any(|configured| pypi_index_urls_match(configured, locked_url));
-                    if !acceptable {
-                        return Err(PlatformUnsat::LockedPyPIIndexMismatch {
-                            name: spec.name.to_string(),
-                            expected_index: effective_indexes.iter().format(", ").to_string(),
-                            locked_index: locked_url.to_string(),
+                    (None, Some(locked_url)) if origin == RequirementOrigin::Manifest => {
+                        // Issue #6060: accept the locked URL if it matches any
+                        // env-level configured index; fall back to PyPI default.
+                        let default_index = &*pixi_consts::consts::DEFAULT_PYPI_INDEX_URL;
+                        let effective_indexes: &[&Url] = if locked_indexes.is_empty() {
+                            std::slice::from_ref(&default_index)
+                        } else {
+                            locked_indexes
+                        };
+                        let acceptable = effective_indexes
+                            .iter()
+                            .any(|configured| pypi_index_urls_match(configured, locked_url));
+                        if !acceptable {
+                            return Err(PlatformUnsat::LockedPyPIIndexMismatch {
+                                name: spec.name.to_string(),
+                                expected_index: effective_indexes.iter().format(", ").to_string(),
+                                locked_index: locked_url.to_string(),
+                            }
+                            .into());
                         }
-                        .into());
                     }
+                    // Either the locked index is missing (pre-v7 lock file) or the
+                    // requirement comes from a parent's `requires_dist` (pep508
+                    // carries no index info, so we trust the lock file's
+                    // recorded index).
+                    (_, None) | (None, _) => {}
                 }
-                // Either the locked index is missing (pre-v7 lock file) or the
-                // requirement comes from a parent's `requires_dist` (pep508
-                // carries no index info, so we trust the lock file's
-                // recorded index).
-                (_, None) | (None, _) => {}
             }
 
             Ok(())

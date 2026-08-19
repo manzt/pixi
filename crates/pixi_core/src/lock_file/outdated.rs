@@ -8,7 +8,8 @@ use super::{
     CondaPrefixUpdater,
     resolve::build_dispatch::LazyBuildDispatchDependencies,
     satisfiability::{
-        VerifySatisfiabilityContext, pypi_metadata, verify_environment_satisfiability,
+        SatisfiabilityMode, VerifySatisfiabilityContext, pypi_metadata,
+        verify_environment_satisfiability_with_mode,
     },
     verify_platform_satisfiability,
 };
@@ -130,6 +131,7 @@ impl<'p> OutdatedEnvironments<'p> {
         command_dispatcher: CommandDispatcher,
         lock_file: &LockFile,
         resolver: &LockFileResolver,
+        satisfiability: SatisfiabilityMode,
     ) -> Self {
         // Find all targets that are not satisfied by the lock file
         let (
@@ -142,7 +144,14 @@ impl<'p> OutdatedEnvironments<'p> {
             build_caches,
             static_metadata_cache,
             locked_pypi_records,
-        ) = find_unsatisfiable_targets(workspace, command_dispatcher, lock_file, resolver).await;
+        ) = find_unsatisfiable_targets(
+            workspace,
+            command_dispatcher,
+            lock_file,
+            resolver,
+            satisfiability,
+        )
+        .await;
 
         // Extend the outdated targets to include the solve groups
         let (mut conda_solve_groups_out_of_date, mut pypi_solve_groups_out_of_date) =
@@ -242,6 +251,7 @@ async fn find_unsatisfiable_targets<'p>(
     command_dispatcher: CommandDispatcher,
     lock_file: &LockFile,
     resolver: &LockFileResolver,
+    satisfiability: SatisfiabilityMode,
 ) -> (
     UnsatisfiableTargets<'p>,
     OnceCell<UvResolutionContext>,
@@ -288,7 +298,11 @@ async fn find_unsatisfiable_targets<'p>(
         };
 
         // The locked environment exists, but does it match our project environment?
-        if let Err(unsat) = verify_environment_satisfiability(&environment, locked_environment) {
+        if let Err(unsat) = verify_environment_satisfiability_with_mode(
+            &environment,
+            locked_environment,
+            satisfiability,
+        ) {
             tracing::info!(
                 "environment '{0}' is out of date because {unsat}",
                 environment.name().fancy_display()
@@ -382,6 +396,7 @@ async fn find_unsatisfiable_targets<'p>(
                 build_caches: &build_caches,
                 static_metadata_cache: &static_metadata_cache,
                 resolver,
+                satisfiability,
             };
             let locked_environment = *locked_environment;
             platform_futures.push(async move {

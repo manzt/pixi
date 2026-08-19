@@ -16,8 +16,9 @@ mod tests;
 // import" warnings now that they live behind module-internal `use`
 // statements. Allow them at the re-export site so the public surface
 // matches the pre-split module exactly.
+pub(crate) use environment::verify_environment_satisfiability_with_mode;
 #[allow(unused_imports)]
-pub use environment::{PypiNoBuildCheck, verify_environment_satisfiability};
+pub use environment::{PypiNoBuildCheck, SatisfiabilityMode, verify_environment_satisfiability};
 #[allow(unused_imports)]
 pub use errors::{
     BuildOrHostEnv, EnvironmentUnsat, ExcludeNewerMismatch, IndexesMismatch, LocalMetadataMismatch,
@@ -32,4 +33,7 @@ pub use platform::{
     resolve_lock_platform_for, verify_platform_satisfiability, verify_solve_group_satisfiability,
 };
 #[allow(unused_imports)]
-pub(crate) use pypi::{pypi_satisfies_editable, pypi_satisfies_requirement};
+pub(crate) use pypi::pypi_satisfies_editable;
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use pypi::pypi_satisfies_requirement;

@@ -1,4 +1,5 @@
 use pixi_consts::consts;
+use pixi_core::lock_file::{LockFileInput, SatisfiabilityMode, UpdateLockFileOptions};
 use rattler_conda_types::Platform;
 use rattler_lock::LockFile;
 use tempfile::TempDir;
@@ -474,5 +475,88 @@ async fn test_removing_environment_unsatisfies_lock_file() {
     assert!(
         lock_file.environment("b").is_none(),
         "environment `b` should have been removed from the lock-file"
+    );
+}
+
+#[tokio::test]
+async fn sufficient_partial_update_falls_back_to_exact_for_all_environments() {
+    setup_tracing();
+
+    let mut old_packages = MockRepoData::default();
+    old_packages.add_package(Package::build("foo", "1").finish());
+    old_packages.add_package(Package::build("bar", "1").finish());
+    let old_channel = TempDir::new().unwrap();
+    old_packages
+        .write_repodata(old_channel.path())
+        .await
+        .unwrap();
+
+    let mut new_packages = MockRepoData::default();
+    new_packages.add_package(Package::build("foo", "2").finish());
+    new_packages.add_package(Package::build("bar", "2").finish());
+    let new_channel = TempDir::new().unwrap();
+    new_packages
+        .write_repodata(new_channel.path())
+        .await
+        .unwrap();
+
+    let old_channel = url::Url::from_file_path(old_channel.path()).unwrap();
+    let new_channel = url::Url::from_file_path(new_channel.path()).unwrap();
+    let platform = Platform::current();
+    let manifest = |channel: &url::Url, foo: &str| {
+        format!(
+            r#"
+    [project]
+    name = "test-sufficient-partial-update"
+    channels = ["{channel}"]
+    platforms = ["{platform}"]
+
+    [feature.a.dependencies]
+    foo = "{foo}"
+
+    [feature.b.dependencies]
+    bar = "*"
+
+    [environments]
+    a = {{ features = ["a"], no-default-feature = true }}
+    b = {{ features = ["b"], no-default-feature = true }}
+    "#
+        )
+    };
+
+    let pixi = PixiControl::from_manifest(&manifest(&old_channel, "==1")).unwrap();
+    let baseline = pixi.update_lock_file().await.unwrap();
+    assert!(baseline.contains_match_spec("a", platform, "foo ==1"));
+    assert!(baseline.contains_match_spec("b", platform, "bar ==1"));
+
+    pixi.update_manifest(&manifest(&new_channel, "==2"))
+        .unwrap();
+    let workspace = pixi.workspace().unwrap();
+    let (updated, changed) = workspace
+        .update_lock_file(
+            None,
+            UpdateLockFileOptions {
+                lock_file_input: LockFileInput::Ephemeral {
+                    lock_file: baseline,
+                    satisfiability: SatisfiabilityMode::Sufficient,
+                },
+                no_install: true,
+                ..UpdateLockFileOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(changed);
+    assert!(
+        updated
+            .lock_file
+            .contains_match_spec("a", platform, "foo ==2")
+    );
+    assert!(
+        updated
+            .lock_file
+            .contains_match_spec("b", platform, "bar ==2"),
+        "once one environment misses the sufficient fast path, unchanged environments must be exactly validated before their records become installable"
     );
 }

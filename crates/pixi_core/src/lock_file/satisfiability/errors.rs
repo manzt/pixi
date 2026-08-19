@@ -426,6 +426,11 @@ pub enum PlatformUnsat {
     MissingPythonInterpreter,
 
     #[error(
+        "the lock file was solved with system requirements incompatible with the tags on wheel ({wheel})"
+    )]
+    PypiWheelTagsMismatch { wheel: String },
+
+    #[error(
         "a marker environment could not be derived from the python interpreter in the lock file"
     )]
     FailedToDetermineMarkerEnvironment(#[source] Box<dyn Diagnostic + Send + Sync>),
@@ -789,6 +794,7 @@ impl PlatformUnsat {
             self,
             PlatformUnsat::UnsatisfiableRequirement(_, _)
                 | PlatformUnsat::TooManyPypiPackages(_)
+                | PlatformUnsat::PypiWheelTagsMismatch { .. }
                 | PlatformUnsat::AsPep508Error(_, _)
                 | PlatformUnsat::FailedToDetermineSourceTreeHash(_, _)
                 | PlatformUnsat::PythonVersionMismatch(_, _, _)

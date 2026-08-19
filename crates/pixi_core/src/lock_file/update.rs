@@ -238,44 +238,51 @@ impl Workspace {
         progress: Option<Arc<pixi_reporters::TopLevelProgress>>,
         options: UpdateLockFileOptions,
     ) -> miette::Result<(LockFileDerivedData<'_>, bool)> {
-        let lock_file_result = self.load_lock_file().await?;
+        let satisfiability = options.lock_file_input.satisfiability();
+        let persist_lock_file = options.lock_file_input.should_persist();
+        let lock_file = if let Some(lock_file) = options.lock_file_input.ephemeral_lock_file() {
+            lock_file.clone()
+        } else {
+            let lock_file_result = self.load_lock_file().await?;
 
-        // Handle version mismatch - error if --locked or --frozen is set
-        if lock_file_result.is_version_mismatch()
-            && (options.lock_file_usage == LockFileUsage::Locked
-                || options.lock_file_usage == LockFileUsage::Frozen)
-        {
-            // Extract the version info for the error message
-            if let LockFileLoadResult::VersionMismatch {
-                lock_file_version,
-                max_supported_version,
-            } = lock_file_result
+            // Handle version mismatch - error if --locked or --frozen is set
+            if lock_file_result.is_version_mismatch()
+                && (options.lock_file_usage == LockFileUsage::Locked
+                    || options.lock_file_usage == LockFileUsage::Frozen)
             {
-                #[cfg(feature = "self_update")]
-                let update_instruction =
-                    "Try running `pixi self-update` to update to the latest version.";
-                #[cfg(not(feature = "self_update"))]
-                let update_instruction = "Please update pixi to the latest version and try again.";
-
-                let help_message = format!(
-                    "Maximum supported version: {} (pixi v{})\n\
-                         Cannot continue with --locked or --frozen mode as the lock file cannot be read.\n\
-                         {}",
-                    max_supported_version,
-                    consts::PIXI_VERSION,
-                    update_instruction
-                );
-
-                return Err(LockFileVersionMismatchError {
+                // Extract the version info for the error message
+                if let LockFileLoadResult::VersionMismatch {
                     lock_file_version,
-                    help_message,
-                }
-                .into());
-            }
-        }
+                    max_supported_version,
+                } = lock_file_result
+                {
+                    #[cfg(feature = "self_update")]
+                    let update_instruction =
+                        "Try running `pixi self-update` to update to the latest version.";
+                    #[cfg(not(feature = "self_update"))]
+                    let update_instruction =
+                        "Please update pixi to the latest version and try again.";
 
-        // Load the lock file, displaying warning if there's a version mismatch
-        let lock_file = lock_file_result.into_lock_file_or_empty_with_warning();
+                    let help_message = format!(
+                        "Maximum supported version: {} (pixi v{})\n\
+                             Cannot continue with --locked or --frozen mode as the lock file cannot be read.\n\
+                             {}",
+                        max_supported_version,
+                        consts::PIXI_VERSION,
+                        update_instruction
+                    );
+
+                    return Err(LockFileVersionMismatchError {
+                        lock_file_version,
+                        help_message,
+                    }
+                    .into());
+                }
+            }
+
+            // Load the lock file, displaying warning if there's a version mismatch
+            lock_file_result.into_lock_file_or_empty_with_warning()
+        };
 
         let needs_format_upgrade = lock_file.version() < rattler_lock::FileFormatVersion::LATEST;
 
@@ -300,6 +307,8 @@ impl Workspace {
             command_dispatcher.clone(),
             glob_hash_cache,
         );
+        derived.requires_completed_prefix =
+            satisfiability == super::satisfiability::SatisfiabilityMode::Sufficient;
 
         // should we check the lock file in the first place?
         if !options.lock_file_usage.should_check_if_out_of_date() {
@@ -314,8 +323,30 @@ impl Workspace {
             command_dispatcher.clone(),
             &derived.lock_file,
             &resolver,
+            satisfiability,
         )
         .await;
+        if satisfiability == super::satisfiability::SatisfiabilityMode::Sufficient
+            && !outdated.is_empty()
+        {
+            // Sufficient validation is an all-or-nothing fast path. Once any
+            // environment needs an update, validate the entire input exactly
+            // before carrying untouched records into the rebuilt lock. This
+            // prevents a partially solved multi-environment result from making
+            // policy-relaxed records installable into a new prefix.
+            tracing::debug!(
+                "sufficient validation missed; falling back to exact lock-file validation"
+            );
+            outdated = OutdatedEnvironments::from_workspace_and_lock_file(
+                self,
+                command_dispatcher.clone(),
+                &derived.lock_file,
+                &resolver,
+                super::satisfiability::SatisfiabilityMode::Exact,
+            )
+            .await;
+            derived.requires_completed_prefix = false;
+        }
         if outdated.is_empty() && !(needs_format_upgrade && options.upgrade_lock_file_format) {
             if needs_format_upgrade {
                 tracing::warn!(
@@ -405,7 +436,7 @@ impl Workspace {
 
         // Write the lock file to disk
 
-        if options.lock_file_usage != LockFileUsage::DryRun {
+        if persist_lock_file && options.lock_file_usage != LockFileUsage::DryRun {
             lock_file_derived_data.write_to_disk()?;
         }
 
@@ -517,6 +548,42 @@ impl From<ParseChannelError> for SolveCondaEnvironmentError {
     }
 }
 
+/// Selects where an update gets its initial lock file and whether the result
+/// may be persisted through the workspace's normal lock-file path.
+#[derive(Debug, Clone, Default)]
+pub enum LockFileInput {
+    /// Load the workspace's persistent lock file, validate it exactly, and
+    /// allow an updated result to be written back to the same path.
+    #[default]
+    Persistent,
+    /// Validate a caller-owned resolution without reading or writing the
+    /// workspace's persistent lock file.
+    Ephemeral {
+        lock_file: LockFile,
+        satisfiability: super::satisfiability::SatisfiabilityMode,
+    },
+}
+
+impl LockFileInput {
+    fn ephemeral_lock_file(&self) -> Option<&LockFile> {
+        match self {
+            Self::Persistent => None,
+            Self::Ephemeral { lock_file, .. } => Some(lock_file),
+        }
+    }
+
+    fn satisfiability(&self) -> super::satisfiability::SatisfiabilityMode {
+        match self {
+            Self::Persistent => super::satisfiability::SatisfiabilityMode::Exact,
+            Self::Ephemeral { satisfiability, .. } => *satisfiability,
+        }
+    }
+
+    fn should_persist(&self) -> bool {
+        matches!(self, Self::Persistent)
+    }
+}
+
 /// Options to pass to [`Workspace::update_lock_file`].
 #[derive(Default)]
 pub struct UpdateLockFileOptions {
@@ -535,6 +602,11 @@ pub struct UpdateLockFileOptions {
     /// value is None a heuristic is used based on the number of cores
     /// available from the system.
     pub max_concurrent_solves: usize,
+
+    /// The resolution to validate and its persistence policy. Persistent lock
+    /// files always use exact satisfiability; ephemeral inputs can opt into
+    /// sufficient satisfiability and are never written through this API.
+    pub lock_file_input: LockFileInput,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -608,6 +680,10 @@ pub struct LockFileDerivedData<'p> {
         Arc<lock_file::outdated::PypiEnvironmentBuildCache>,
     >,
 
+    /// Sufficient validation deliberately excludes acquisition policy, so the
+    /// result may be reused only when its completed prefix already exists.
+    requires_completed_prefix: bool,
+
     /// Lazily-built resolver for `lock_file`. Built once on first access to
     /// [`Self::resolver`] and reused across all downstream consumers. Kept
     /// private so all interaction goes through the accessor method.
@@ -632,7 +708,7 @@ impl<'p> LockFileDerivedData<'p> {
     /// Construct a derived-data wrapper whose runtime state is empty. Intended
     /// for the start of an update flow or any caller that needs the lazy
     /// resolver cache but has no prefixes, caches, or solved records yet.
-    pub fn from_input_lock_file(
+    pub(crate) fn from_input_lock_file(
         workspace: &'p Workspace,
         lock_file: LockFile,
         package_cache: PackageCache,
@@ -651,6 +727,7 @@ impl<'p> LockFileDerivedData<'p> {
             command_dispatcher,
             glob_hash_cache,
             build_caches: Default::default(),
+            requires_completed_prefix: false,
             resolver: Default::default(),
         }
     }
@@ -804,6 +881,15 @@ impl<'p> LockFileDerivedData<'p> {
         // Check if the prefix is already up-to-date by validating the hash with the
         // environment file
         let hash = self.locked_environment_hash(environment)?;
+        if self.requires_completed_prefix {
+            if let Some(prefix) = self.cached_prefix(environment, &hash) {
+                return prefix;
+            }
+            miette::bail!(
+                "a sufficiently validated resolution cannot install or repair environment '{}'; validate it exactly first",
+                environment.name().fancy_display()
+            );
+        }
         if update_mode == UpdateMode::QuickValidate
             && let Some(prefix) = self.cached_prefix(environment, &hash)
         {
@@ -867,6 +953,22 @@ impl<'p> LockFileDerivedData<'p> {
         }
 
         Ok(prefix)
+    }
+
+    /// Returns whether the environment's completed-install marker proves that
+    /// this exact resolution is already installed.
+    ///
+    /// Sufficient script validation deliberately ignores resolver acquisition
+    /// policy, just like uv's installed-environment fast path. Callers must only
+    /// use that permissive result without an exact policy check when this method
+    /// returns `true`; otherwise repairing the prefix could fetch or build an
+    /// artifact that the current channel, index, or build policy rejects.
+    pub fn prefix_is_up_to_date(&self, environment: &Environment<'p>) -> miette::Result<bool> {
+        let hash = self.locked_environment_hash(environment)?;
+        Ok(self
+            .cached_prefix(environment, &hash)
+            .transpose()?
+            .is_some())
     }
 
     fn cached_prefix(
@@ -1865,6 +1967,7 @@ impl<'p> UpdateContextBuilder<'p> {
                     self.command_dispatcher.clone(),
                     &input.lock_file,
                     &resolver,
+                    super::satisfiability::SatisfiabilityMode::Exact,
                 )
                 .await
             }
@@ -2719,6 +2822,7 @@ impl<'p> UpdateContext<'p> {
             command_dispatcher: self.command_dispatcher,
             glob_hash_cache: self.glob_hash_cache,
             build_caches: self.outdated_envs.build_caches,
+            requires_completed_prefix: false,
             resolver: Default::default(),
         })
     }
@@ -3570,6 +3674,28 @@ mod tests {
     use super::*;
     use pixi_manifest::PyPiDependencies;
     use pixi_pypi_spec::PixiPypiSpec;
+
+    #[test]
+    fn persistent_and_ephemeral_inputs_have_distinct_validation_and_write_policies() {
+        let persistent = LockFileInput::default();
+        assert_eq!(
+            persistent.satisfiability(),
+            super::super::satisfiability::SatisfiabilityMode::Exact
+        );
+        assert!(persistent.should_persist());
+        assert!(persistent.ephemeral_lock_file().is_none());
+
+        let ephemeral = LockFileInput::Ephemeral {
+            lock_file: LockFile::default(),
+            satisfiability: super::super::satisfiability::SatisfiabilityMode::Sufficient,
+        };
+        assert_eq!(
+            ephemeral.satisfiability(),
+            super::super::satisfiability::SatisfiabilityMode::Sufficient
+        );
+        assert!(!ephemeral.should_persist());
+        assert!(ephemeral.ephemeral_lock_file().is_some());
+    }
 
     #[test]
     fn test_format_unknown_extra_warning() {
