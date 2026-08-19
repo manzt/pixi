@@ -940,41 +940,148 @@ pub async fn get_update_lock_file_and_prefixes<'env>(
     let requirements = extract_git_requirements_from_workspace(workspace);
     store_credentials_from_requirements(requirements);
 
-    // Ensure that the lock file is up-to-date
-    let mut lock_file = workspace
-        .update_lock_file(
-            progress.clone(),
-            UpdateLockFileOptions {
-                lock_file_usage: update_lock_file_options.lock_file_usage,
-                no_install,
-                max_concurrent_solves: update_lock_file_options.max_concurrent_solves,
-                ..Default::default()
-            },
-        )
-        .await?
-        .0;
-    // Pin the override so the downstream prefix helpers see it without a
-    // fresh parameter on every call.
-    lock_file.target_platform = target_platform.cloned();
+    const MAX_SCRIPT_SYNC_ATTEMPTS: usize = 3;
+    for attempt in 1..=MAX_SCRIPT_SYNC_ATTEMPTS {
+        // Ensure that the lock file is up-to-date.
+        let mut lock_file = workspace
+            .update_lock_file(
+                progress.clone(),
+                UpdateLockFileOptions {
+                    lock_file_usage: update_lock_file_options.lock_file_usage,
+                    no_install,
+                    shadow_script_resolution: workspace.is_script() && !no_install,
+                    max_concurrent_solves: update_lock_file_options.max_concurrent_solves,
+                    ..Default::default()
+                },
+            )
+            .await?
+            .0;
+        // Pin the override so the downstream prefix helpers see it without a
+        // fresh parameter on every call.
+        lock_file.target_platform = target_platform.cloned();
 
-    // Get the prefix from the lock file.
-    let lock_file_ref = &lock_file;
-    let reinstall_packages = &reinstall_packages;
-    let prefixes = stream::iter(environments.iter())
-        .map(move |env| {
-            if no_install {
-                std::future::ready(Ok(Prefix::new(env.dir()))).left_future()
-            } else {
-                lock_file_ref
-                    .prefix(env, update_mode, reinstall_packages, filter)
-                    .right_future()
+        // An eager sidecar operation shadows its winning candidate into the
+        // hidden state before releasing the prefix. If the user removes the
+        // sidecar while installation is in flight, reconciliation can adopt
+        // that exact candidate instead of reviving an older cache entry.
+        if workspace.is_script() && !no_install {
+            match workspace.acquire_script_resolution_state().await {
+                Ok(guard) => {
+                    workspace.ensure_script_metadata_unchanged().await?;
+                    let current_has_sidecar = workspace
+                        .persistent_lock_file_path()
+                        .is_some_and(|path| path.is_file());
+                    let candidate_is_current = if current_has_sidecar {
+                        let current = workspace
+                            .load_lock_file()
+                            .await?
+                            .into_lock_file_or_empty_with_warning();
+                        workspace::script_resolutions_equal(
+                            Some(lock_file.as_lock_file()),
+                            Some(&current),
+                        )?
+                    } else {
+                        workspace::script_resolutions_equal(
+                            Some(lock_file.as_lock_file()),
+                            guard.load(workspace).await.as_ref(),
+                        )?
+                    };
+                    if candidate_is_current
+                        && let Err(error) = guard.store(lock_file.as_lock_file()).await
+                    {
+                        tracing::warn!(
+                            %error,
+                            "failed to shadow the script resolution before synchronization"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "failed to shadow the script resolution before synchronization"
+                ),
             }
-        })
-        .buffer_unordered(environments.len())
-        .try_collect()
-        .await?;
+        }
 
-    Ok((lock_file, prefixes))
+        // Get the prefix from the lock file.
+        let lock_file_ref = &lock_file;
+        let reinstall_packages = &reinstall_packages;
+        let prefixes = stream::iter(environments.iter())
+            .map(move |env| {
+                if no_install {
+                    std::future::ready(Ok(Prefix::new(env.dir()))).left_future()
+                } else {
+                    lock_file_ref
+                        .prefix(env, update_mode, reinstall_packages, filter)
+                        .right_future()
+                }
+            })
+            .buffer_unordered(environments.len())
+            .try_collect()
+            .await?;
+
+        if !workspace.is_script() || no_install {
+            return Ok((lock_file, prefixes));
+        }
+
+        // Prefix work is intentionally outside the script publication guard.
+        // Confirm that the sidecar still describes what was installed before
+        // refreshing hidden state. If another writer won, install its newer
+        // authority before reporting success.
+        let script_resolution_guard = match workspace.acquire_script_resolution_state().await {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "failed to refresh the cached script resolution; the sidecar lock remains authoritative"
+                );
+                None
+            }
+        };
+        workspace.ensure_script_metadata_unchanged().await?;
+        let current_has_sidecar = workspace
+            .persistent_lock_file_path()
+            .is_some_and(|path| path.is_file());
+        let current = if current_has_sidecar {
+            workspace
+                .load_lock_file()
+                .await?
+                .into_lock_file_or_empty_with_warning()
+        } else if let Some(guard) = script_resolution_guard.as_ref() {
+            guard.load(workspace).await.unwrap_or_default()
+        } else {
+            return Err(crate::workspace::ScriptResolutionConflictError.into());
+        };
+        if workspace::script_resolutions_equal(Some(lock_file.as_lock_file()), Some(&current))? {
+            if current_has_sidecar
+                && let Some(guard) = script_resolution_guard.as_ref()
+                && let Err(error) = guard.store(lock_file.as_lock_file()).await
+            {
+                tracing::warn!(
+                    %error,
+                    "failed to refresh the cached script resolution; the sidecar lock remains authoritative"
+                );
+            }
+            return Ok((lock_file, prefixes));
+        }
+
+        if !current_has_sidecar {
+            drop(script_resolution_guard);
+            workspace.reconcile_script_prefix_to_authority().await?;
+            return Err(crate::workspace::ScriptResolutionConflictError.into());
+        }
+
+        drop(script_resolution_guard);
+        if attempt == MAX_SCRIPT_SYNC_ATTEMPTS {
+            workspace.reconcile_script_prefix_to_authority().await?;
+            return Err(crate::workspace::ScriptResolutionConflictError.into());
+        }
+        tracing::debug!(
+            attempt,
+            "script resolution changed during installation; retrying"
+        );
+    }
+
+    unreachable!("the bounded script synchronization loop always returns")
 }
 
 pub type PerEnvironment<'p, T> = HashMap<Environment<'p>, T>;

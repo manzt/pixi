@@ -4,7 +4,7 @@ use clap::Parser;
 use pep508_rs::Requirement;
 use pixi_api::{
     WorkspaceContext,
-    workspace::{DependencyOptions, GitOptions},
+    workspace::{DependencyOptions, DependencyUpdateCancelled, GitOptions},
 };
 use pixi_config::ConfigCli;
 use pixi_consts::consts;
@@ -22,6 +22,16 @@ use crate::{
     cli_interface::CliInterface,
     has_specs::HasSpecs,
 };
+
+fn exit_if_dependency_update_cancelled<T>(result: miette::Result<T>) -> miette::Result<T> {
+    match result {
+        Err(error) if error.downcast_ref::<DependencyUpdateCancelled>().is_some() => {
+            eprintln!("dependency update cancelled");
+            std::process::exit(130);
+        }
+        result => result,
+    }
+}
 
 /// Adds dependencies to the workspace
 ///
@@ -243,14 +253,16 @@ pub async fn execute(args: Args) -> miette::Result<()> {
                     .keys()
                     .map(|n| n.as_normalized().to_string())
                     .collect();
-                let result = workspace_ctx
-                    .add_conda_deps(
-                        specs,
-                        spec_type,
-                        args.dependency_options(&workspace)?,
-                        git_options,
-                    )
-                    .await?;
+                let result = exit_if_dependency_update_cancelled(
+                    workspace_ctx
+                        .add_conda_deps(
+                            specs,
+                            spec_type,
+                            args.dependency_options(&workspace)?,
+                            git_options,
+                        )
+                        .await,
+                )?;
                 (result.0, result.1, names)
             }
             DependencyType::PypiDependency => {
@@ -270,13 +282,15 @@ pub async fn execute(args: Args) -> miette::Result<()> {
                     .keys()
                     .map(|n| n.as_normalized().to_string())
                     .collect();
-                let result = workspace_ctx
-                    .add_pypi_deps(
-                        pypi_deps,
-                        args.editable,
-                        args.dependency_options(&workspace)?,
-                    )
-                    .await?;
+                let result = exit_if_dependency_update_cancelled(
+                    workspace_ctx
+                        .add_pypi_deps(
+                            pypi_deps,
+                            args.editable,
+                            args.dependency_options(&workspace)?,
+                        )
+                        .await,
+                )?;
                 (result.0, result.1, names)
             }
         };

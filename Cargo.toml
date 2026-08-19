@@ -227,6 +227,7 @@ uv-types = { git = "https://github.com/astral-sh/uv", tag = "0.11.15" }
 uv-workspace = { git = "https://github.com/astral-sh/uv", tag = "0.11.15" }
 webpki-root-certs = "1"
 which = "8.0.0"
+windows-sys = "0.61.2"
 xxhash-rust = "0.8.15"
 zip = { version = "8.0.0", default-features = false }
 zstd = { version = "0.13.3", default-features = false }

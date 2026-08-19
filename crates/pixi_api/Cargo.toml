@@ -38,7 +38,7 @@ same-file = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["fs", "signal"] }
 tracing = { workspace = true }
 url = { workspace = true }
 uv-distribution = { workspace = true }

@@ -26,10 +26,27 @@ fn temp_file_for(
     let mut builder = tempfile::Builder::new();
     builder.prefix(&prefix);
     #[cfg(unix)]
-    if let Some(p) = _perms {
-        builder.permissions(p);
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // tempfile defaults regular files to 0o600. For a new destination we
+        // want the same umask-derived mode as File::create (0o666 & umask),
+        // while rewrites start no more permissively than the existing file.
+        builder.permissions(
+            _perms
+                .clone()
+                .unwrap_or_else(|| std::fs::Permissions::from_mode(0o666)),
+        );
     }
-    builder.tempfile_in(dir)
+    let temp_file = builder.tempfile_in(dir)?;
+    #[cfg(unix)]
+    if let Some(perms) = _perms {
+        // `open(2)` still applies the current umask to Builder's requested
+        // mode. Restore an existing destination's exact mode before the
+        // temporary inode can be published by rename.
+        fs_err::set_permissions(temp_file.path(), perms)?;
+    }
+    Ok(temp_file)
 }
 
 /// Return the permissions of an existing file at `path`, or `None` if the file
@@ -85,6 +102,19 @@ pub async fn atomic_write(path: &Path, contents: impl AsRef<[u8]>) -> std::io::R
     Ok(())
 }
 
+/// Atomically replace `path`, returning an error instead of falling back to a
+/// truncating write when its parent cannot host a temporary file.
+pub async fn atomic_write_strict(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let perms = original_permissions(path)?;
+    let temp_file = temp_file_for(path, perms)?;
+    let temp_path = temp_file.into_temp_path();
+    tokio_fs::write(&temp_path, contents.as_ref()).await?;
+    temp_path
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+}
+
 /// Synchronous version of [`atomic_write`].
 pub fn atomic_write_sync(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
     let perms = original_permissions(path)?;
@@ -105,6 +135,17 @@ pub fn atomic_write_sync(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Re
 
     temp_file.persist(path).map_err(|e| e.error)?;
     Ok(())
+}
+
+/// Synchronous strict variant of [`atomic_write_strict`].
+pub fn atomic_write_sync_strict(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let perms = original_permissions(path)?;
+    let mut temp_file = temp_file_for(path, perms)?;
+    std::io::Write::write_all(&mut temp_file, contents.as_ref())?;
+    temp_file
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
 }
 
 #[cfg(test)]
@@ -132,6 +173,58 @@ mod tests {
         assert!(
             name.starts_with(".pixi.toml."),
             "expected prefix `.pixi.toml.`, got `{name}`"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_atomic_write_new_file_uses_regular_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let reference = dir.path().join("reference");
+        let target = dir.path().join("pixi.lock");
+        std::fs::File::create(&reference).unwrap();
+
+        atomic_write_sync_strict(&target, b"version: 1\n").unwrap();
+
+        assert_eq!(
+            fs_err::metadata(&target).unwrap().permissions().mode() & 0o777,
+            fs_err::metadata(&reference).unwrap().permissions().mode() & 0o777,
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_atomic_write_preserves_permissions_under_restrictive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD_PATH: &str = "PIXI_ATOMIC_WRITE_UMASK_TARGET";
+        if let Some(target) = std::env::var_os(CHILD_PATH) {
+            atomic_write_sync_strict(Path::new(&target), b"updated\n").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("pixi.lock");
+        fs_err::write(&target, b"original\n").unwrap();
+        fs_err::set_permissions(&target, std::fs::Permissions::from_mode(0o664)).unwrap();
+
+        let status = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "umask 077; exec \"$1\" --exact atomic_write::tests::test_atomic_write_preserves_permissions_under_restrictive_umask --nocapture",
+                "sh",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .env(CHILD_PATH, &target)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        assert_eq!(
+            fs_err::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o664,
         );
     }
 

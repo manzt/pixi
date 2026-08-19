@@ -2,14 +2,14 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use crate::lock_file::SolveCondaEnvironmentError;
 use fancy_display::FancyDisplay;
 use indexmap::IndexMap;
 use itertools::Itertools;
-use miette::{IntoDiagnostic, NamedSource};
+use miette::{Context, IntoDiagnostic, NamedSource};
 use pep440_rs::VersionSpecifiers;
 use pep508_rs::{Requirement, VersionOrUrl::VersionSpecifier};
 use pixi_command_dispatcher::{MissingChannelError, SolvePixiEnvironmentError::MissingChannel};
@@ -32,8 +32,9 @@ use crate::{
     environment::LockFileUsage,
     lock_file::{LockFileDerivedData, ReinstallPackages, UpdateContext, UpdateMode},
     workspace::{
-        MatchSpecs, NON_SEMVER_PACKAGES, PypiDeps, SkippedPackage, SourceSpecs, UpdateDeps,
-        WorkspaceStorage, grouped_environment::GroupedEnvironment,
+        MatchSpecs, NON_SEMVER_PACKAGES, PypiDeps, ScriptLockFileState, ScriptResolutionFileState,
+        SkippedPackage, SourceSpecs, UpdateDeps, WorkspaceStorage,
+        grouped_environment::GroupedEnvironment, script_resolutions_equal,
     },
 };
 
@@ -59,9 +60,9 @@ struct OriginalContent {
 /// Any changes made to this struct are *not* persisted until the
 /// [`WorkspaceMut::save`] method is called. If the changes should be reverted
 /// to the original state (in case of an error for instance) the
-/// [`WorkspaceMut::revert`] method can be used. If the struct is dropped
-/// without calling either [`WorkspaceMut::save`] or [`WorkspaceMut::revert`]
-/// the changes are also reverted.
+/// [`WorkspaceMut::revert`] method can be used. Dropped project mutations are
+/// reverted as a final safeguard. Script mutations require asynchronous
+/// sidecar coordination, so callers must explicitly save or revert them.
 pub struct WorkspaceMut {
     // This is an option to indicate whether this instance has been consumed. Both `save` and
     // `revert` return the original workspace from which this instance was created and return this
@@ -77,6 +78,12 @@ pub struct WorkspaceMut {
     // Defines whether the content on disk has been modified. E.g. whether
     // there are intermediate changes that have not been saved.
     modified: bool,
+
+    // Exact sidecar snapshots used to roll script edits back as a coherent
+    // manifest-and-lock pair.
+    script_lock_file_state_before_edit: Option<ScriptLockFileState>,
+    script_lock_file_state_after_edit: Mutex<Option<ScriptLockFileState>>,
+    script_resolution_state_before_edit: Option<ScriptResolutionFileState>,
 
     // The parsed toml document.
     workspace_manifest_document: ManifestDocument,
@@ -127,6 +134,9 @@ impl WorkspaceMut {
                 source: contents.clone(),
             }),
             modified: false,
+            script_lock_file_state_before_edit: None,
+            script_lock_file_state_after_edit: Mutex::new(None),
+            script_resolution_state_before_edit: None,
 
             workspace: Some(workspace),
             workspace_manifest_document,
@@ -164,6 +174,9 @@ impl WorkspaceMut {
         Ok(Self {
             original: None,
             modified: true, // The content is not on disk yet, so we are in a modified state.
+            script_lock_file_state_before_edit: None,
+            script_lock_file_state_after_edit: Mutex::new(None),
+            script_resolution_state_before_edit: None,
 
             workspace: Some(workspace),
             workspace_manifest_document,
@@ -223,11 +236,75 @@ impl WorkspaceMut {
     /// to continue the modification.
     async fn save_inner(&mut self) -> Result<(), std::io::Error> {
         let manifest_path = self.workspace().workspace.provenance.path.clone();
-        let new_contents = self
-            .workspace_manifest_document
-            .render()
+        let script_resolution_guard = if self.workspace().is_script() {
+            match self.workspace().acquire_script_resolution_state().await {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "failed to coordinate the script manifest; continuing with optimistic publication"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if self.workspace().is_script() && self.script_lock_file_state_before_edit.is_none() {
+            self.script_lock_file_state_before_edit = Some(
+                self.workspace()
+                    .script_lock_file_state()
+                    .await
+                    .map_err(std::io::Error::other)?,
+            );
+        }
+        if self.workspace().is_script() {
+            if self.script_resolution_state_before_edit.is_none()
+                && let Some(guard) = script_resolution_guard.as_ref()
+            {
+                self.script_resolution_state_before_edit =
+                    Some(guard.file_state().await.map_err(std::io::Error::other)?);
+            }
+            self.save_script_inner(&manifest_path)?;
+        } else {
+            let new_contents = self
+                .workspace_manifest_document
+                .render()
+                .map_err(std::io::Error::other)?;
+            pixi_utils::atomic_write::atomic_write(&manifest_path, new_contents).await?;
+            self.modified = true;
+        }
+        Ok(())
+    }
+
+    /// Publish the in-memory PEP 723 document while the caller holds the
+    /// script-resolution guard. There is no cancellation point from the atomic
+    /// manifest replace through updating the in-memory script snapshot.
+    fn save_script_inner(&mut self, manifest_path: &std::path::Path) -> Result<(), std::io::Error> {
+        let current = ScriptManifest::from_path(manifest_path)
+            .map_err(std::io::Error::other)?
+            .ok_or_else(|| {
+                std::io::Error::other("script no longer contains a PEP 723 metadata block")
+            })?;
+        let expected = self
+            .workspace()
+            .script_manifest()
+            .expect("script workspaces retain their parsed manifest");
+        if current
+            .environment_metadata_edit_fingerprint()
+            .map_err(std::io::Error::other)?
+            != expected
+                .environment_metadata_edit_fingerprint()
+                .map_err(std::io::Error::other)?
+        {
+            return Err(std::io::Error::other(
+                crate::workspace::ScriptResolutionConflictError,
+            ));
+        }
+        let new_contents = current
+            .render_pyproject_document(self.workspace_manifest_document.manifest().as_document())
             .map_err(std::io::Error::other)?;
-        pixi_utils::atomic_write::atomic_write(&manifest_path, new_contents).await?;
+        pixi_utils::atomic_write::atomic_write_sync_strict(manifest_path, new_contents)?;
         self.modified = true;
 
         if let WorkspaceStorage::Script { manifest, .. } = &mut self
@@ -236,7 +313,7 @@ impl WorkspaceMut {
             .expect("workspace is not available")
             .storage
         {
-            **manifest = ScriptManifest::from_path(&manifest_path)
+            **manifest = ScriptManifest::from_path(manifest_path)
                 .map_err(std::io::Error::other)?
                 .ok_or_else(|| {
                     std::io::Error::other(
@@ -254,17 +331,156 @@ impl WorkspaceMut {
         Ok(self.workspace.take().expect("workspace is not available"))
     }
 
+    /// Save a lockless script edit and invalidate its cached resolution as one
+    /// guarded publication. Clearing first is safe because readers cannot
+    /// observe the cache miss until the new manifest has been atomically saved.
+    pub async fn save_and_clear_script_resolution(mut self) -> Result<Workspace, std::io::Error> {
+        if !self.workspace().is_script() {
+            return self.save().await;
+        }
+        let guard = self
+            .workspace()
+            .acquire_script_resolution_state()
+            .await
+            .map_err(std::io::Error::other)?;
+        let current_sidecar = self
+            .workspace()
+            .script_lock_file_state()
+            .await
+            .map_err(std::io::Error::other)?;
+        if !current_sidecar.is_absent() {
+            return Err(std::io::Error::other(
+                crate::workspace::ScriptResolutionConflictError,
+            ));
+        }
+        if self.script_lock_file_state_before_edit.is_none() {
+            self.script_lock_file_state_before_edit = Some(current_sidecar);
+        }
+        let resolution_state = guard.file_state().await.map_err(std::io::Error::other)?;
+        if self.script_resolution_state_before_edit.is_none() {
+            self.script_resolution_state_before_edit = Some(resolution_state.clone());
+        }
+        guard.clear().await.map_err(std::io::Error::other)?;
+        let path = self.workspace().workspace.provenance.path.clone();
+        if let Err(save_error) = self.save_script_inner(&path) {
+            if let Err(restore_error) = guard.restore_file_state(&resolution_state).await {
+                return Err(std::io::Error::other(format!(
+                    "failed to save script metadata: {save_error}; also failed to restore its cached resolution: {restore_error}"
+                )));
+            }
+            return Err(save_error);
+        }
+        drop(guard);
+        Ok(self.workspace.take().expect("workspace is not available"))
+    }
+
     /// Revert the changes made to the workspace manifest and returns the
     /// unmodified [`Workspace`].
     pub async fn revert(mut self) -> Result<Workspace, std::io::Error> {
+        if self.workspace().is_script() && self.modified {
+            let script_resolution_guard = self
+                .workspace()
+                .acquire_script_resolution_state()
+                .await
+                .map_err(std::io::Error::other)?;
+            let path = self.workspace().workspace.provenance.path.clone();
+            let current = ScriptManifest::from_path(&path)
+                .map_err(std::io::Error::other)?
+                .ok_or_else(|| {
+                    std::io::Error::other("script no longer contains a PEP 723 metadata block")
+                })?;
+            let expected = self
+                .workspace()
+                .script_manifest()
+                .expect("script workspaces retain their parsed manifest");
+            let expected_sidecar = self
+                .script_lock_file_state_after_edit
+                .lock()
+                .expect("script sidecar snapshot mutex is not poisoned")
+                .clone()
+                .or_else(|| self.script_lock_file_state_before_edit.clone())
+                .ok_or_else(|| {
+                    std::io::Error::other("script rollback is missing its sidecar snapshot")
+                })?;
+            if current
+                .environment_metadata_edit_fingerprint()
+                .map_err(std::io::Error::other)?
+                != expected
+                    .environment_metadata_edit_fingerprint()
+                    .map_err(std::io::Error::other)?
+                || !self
+                    .workspace()
+                    .script_lock_file_state_is_current(&expected_sidecar)
+                    .await
+                    .map_err(std::io::Error::other)?
+            {
+                return Err(std::io::Error::other(
+                    crate::workspace::ScriptResolutionConflictError,
+                ));
+            }
+
+            let original = self
+                .original
+                .as_ref()
+                .expect("loaded workspaces retain original data");
+            let original_script = ScriptManifest::from_source(&path, original.source.as_bytes())
+                .map_err(std::io::Error::other)?
+                .ok_or_else(|| {
+                    std::io::Error::other(
+                        "original script did not contain a PEP 723 metadata block",
+                    )
+                })?;
+            let restored = current
+                .render_environment_metadata_from(&original_script)
+                .map_err(std::io::Error::other)?;
+            self.workspace()
+                .restore_script_lock_file_state(
+                    self.script_lock_file_state_before_edit
+                        .as_ref()
+                        .expect("a modified script captured its original sidecar"),
+                )
+                .await
+                .map_err(std::io::Error::other)?;
+            if let Some(state) = self.script_resolution_state_before_edit.as_ref() {
+                script_resolution_guard
+                    .restore_file_state(state)
+                    .await
+                    .map_err(std::io::Error::other)?;
+            }
+            pixi_utils::atomic_write::atomic_write_sync_strict(&path, restored)?;
+        }
+
         let mut workspace = self.workspace.take().expect("workspace is not available");
         if let Some(original) = self.original.take() {
-            workspace.workspace.value = original.manifest;
-            pixi_utils::atomic_write::atomic_write(
-                &workspace.workspace.provenance.path,
-                original.source,
-            )
-            .await?;
+            if workspace.is_script() {
+                let script = ScriptManifest::from_path(&workspace.workspace.provenance.path)
+                    .map_err(std::io::Error::other)?
+                    .ok_or_else(|| {
+                        std::io::Error::other(
+                            "restored script no longer contains a PEP 723 metadata block",
+                        )
+                    })?;
+                let backend_override = workspace.backend_override.clone();
+                let pixi_manifest::WithWarnings {
+                    value: mut refreshed,
+                    warnings,
+                } = Workspace::from_script(script, workspace.config.clone())
+                    .map_err(std::io::Error::other)?;
+                for warning in warnings {
+                    tracing::warn!("{warning}");
+                }
+                if let Some(backend_override) = backend_override {
+                    refreshed = refreshed.with_backend_override(backend_override);
+                }
+                workspace = refreshed;
+            } else {
+                workspace.workspace.value = original.manifest;
+                pixi_utils::atomic_write::atomic_write(
+                    &workspace.workspace.provenance.path,
+                    original.source,
+                )
+                .await?;
+            }
         }
 
         Ok(workspace)
@@ -364,9 +580,10 @@ impl WorkspaceMut {
             }
         }
 
-        // Save Python-backed manifests before resolving so tools like `pixi
-        // build` and `uv` observe the changes.
-        if matches!(self.kind(), ManifestKind::Pyproject | ManifestKind::Pep723) {
+        // A pyproject is itself build-tool input and must be visible while
+        // resolving. PEP 723 edits stay in memory until the solve succeeds so
+        // cancellation cannot expose a candidate script against an old lock.
+        if matches!(self.kind(), ManifestKind::Pyproject) {
             self.save_inner().await.into_diagnostic()?;
         }
 
@@ -374,11 +591,40 @@ impl WorkspaceMut {
             return Ok((None, skipped_packages));
         }
 
+        let initial_script_guard = if self.workspace().is_script() {
+            match self.workspace().acquire_script_resolution_state().await {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "failed to coordinate the script lock file; continuing with durable publication"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let script_lock_file_state = if self.workspace().is_script() {
+            self.workspace().ensure_script_metadata_unchanged().await?;
+            Some(self.workspace().script_lock_file_state().await?)
+        } else {
+            None
+        };
+        if let Some(state) = script_lock_file_state.as_ref() {
+            self.script_lock_file_state_before_edit = Some(state.clone());
+        }
+        if self.script_resolution_state_before_edit.is_none()
+            && let Some(guard) = initial_script_guard.as_ref()
+        {
+            self.script_resolution_state_before_edit = Some(guard.file_state().await?);
+        }
         let original_lock_file = self
             .workspace()
             .load_lock_file()
             .await?
             .into_lock_file_or_empty_with_warning();
+        drop(initial_script_guard);
         let affected_environments = self
             .workspace()
             .environments()
@@ -440,28 +686,31 @@ impl WorkspaceMut {
                 .map(|(e, p)| (e.as_str(), p.clone()))
                 .collect(),
         );
-        let LockFileDerivedData {
-            workspace: _, // We don't need the project here
-            lock_file,
-            package_cache,
-            uv_context,
-            updated_conda_prefixes,
-            updated_pypi_prefixes,
-            command_dispatcher,
-            glob_hash_cache,
-            io_concurrency_limit,
-            build_caches,
-            ..
-        } = UpdateContext::builder(
-            self.workspace(),
-            self.workspace().command_dispatcher_builder()?.finish(),
-        )?
-        .with_lock_file(unlocked_lock_file)
-        .with_no_install(no_install || dry_run)
-        .finish()
-        .await?
-        .update()
-        .await
+        let solved = if self.workspace().is_script() {
+            let solve_dir = tempfile::tempdir()
+                .into_diagnostic()
+                .wrap_err("failed to create a temporary script solve environment")?;
+            let solve_workspace = self
+                .workspace()
+                .clone()
+                .with_script_pixi_dir(solve_dir.path().join("environment"));
+            let solved = solve_dependency_lock_file(
+                &solve_workspace,
+                unlocked_lock_file,
+                no_install || dry_run,
+            )
+            .await;
+            match solved {
+                Ok(solved) => {
+                    let dispatcher = self.workspace().command_dispatcher_builder()?.finish();
+                    Ok(solved.rebind_workspace(self.workspace(), dispatcher))
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            solve_dependency_lock_file(self.workspace(), unlocked_lock_file, no_install || dry_run)
+                .await
+        }
         .map_err(|mut e| {
             if let Some(SolveCondaEnvironmentError::SolveFailed { source, .. }) =
                 e.downcast_mut::<SolveCondaEnvironmentError>()
@@ -478,6 +727,20 @@ impl WorkspaceMut {
             }
             e
         })?;
+
+        let LockFileDerivedData {
+            workspace: _, // We don't need the project here
+            lock_file,
+            package_cache,
+            uv_context,
+            updated_conda_prefixes,
+            updated_pypi_prefixes,
+            command_dispatcher,
+            glob_hash_cache,
+            io_concurrency_limit,
+            build_caches,
+            ..
+        } = solved;
 
         let mut implicit_constraints = HashMap::new();
         if !conda_specs_to_add_constraints_for.is_empty() {
@@ -503,28 +766,81 @@ impl WorkspaceMut {
             implicit_constraints.extend(pypi_constraints);
         }
 
-        // Save Python-backed manifests again after applying resolved constraints.
-        if matches!(self.kind(), ManifestKind::Pyproject | ManifestKind::Pep723) {
+        // A pyproject is external build input and was published before solving;
+        // save it again after applying resolved constraints. PEP 723 metadata is
+        // published atomically with its sidecar below.
+        if matches!(self.kind(), ManifestKind::Pyproject) {
             self.save_inner().await.into_diagnostic()?;
         }
 
-        // Re-wrap the derived data under the longer-lived workspace
-        // reference.
-        let mut updated_lock_file = LockFileDerivedData::from_input_lock_file(
-            self.workspace(),
-            lock_file,
-            package_cache,
-            command_dispatcher,
-            glob_hash_cache,
-        );
-        updated_lock_file.updated_conda_prefixes = updated_conda_prefixes;
-        updated_lock_file.updated_pypi_prefixes = updated_pypi_prefixes;
-        updated_lock_file.uv_context = uv_context;
-        updated_lock_file.io_concurrency_limit = io_concurrency_limit;
-        updated_lock_file.build_caches = build_caches;
-        if !dry_run {
-            updated_lock_file.write_to_disk()?;
-        }
+        let (updated_lock_file, published_script_lock_state) = {
+            let script_resolution_guard = if self.workspace().is_script() && !dry_run {
+                match self.workspace().acquire_script_resolution_state().await {
+                    Ok(guard) => Some(guard),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "failed to coordinate the script lock file; continuing with durable publication"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if !dry_run && let Some(expected) = script_lock_file_state.as_ref() {
+                self.workspace().ensure_script_metadata_unchanged().await?;
+                self.workspace()
+                    .ensure_script_lock_file_state(expected)
+                    .await?;
+            }
+            if !dry_run && self.workspace().is_script() {
+                let path = self.workspace().workspace.provenance.path.clone();
+                self.save_script_inner(&path).into_diagnostic()?;
+            }
+
+            // Re-wrap the derived data only after a PEP 723 manifest has been
+            // published, so its workspace reference sees the winning script.
+            let mut updated_lock_file = LockFileDerivedData::from_input_lock_file(
+                self.workspace(),
+                lock_file,
+                package_cache,
+                command_dispatcher,
+                glob_hash_cache,
+            );
+            updated_lock_file.updated_conda_prefixes = updated_conda_prefixes;
+            updated_lock_file.updated_pypi_prefixes = updated_pypi_prefixes;
+            updated_lock_file.uv_context = uv_context;
+            updated_lock_file.io_concurrency_limit = io_concurrency_limit;
+            updated_lock_file.build_caches = build_caches;
+
+            let published_script_lock_state = if !dry_run && self.workspace().is_script() {
+                let published_contents = updated_lock_file.write_to_disk()?;
+                let state = ScriptLockFileState::from_contents(published_contents);
+                *self
+                    .script_lock_file_state_after_edit
+                    .lock()
+                    .expect("script sidecar snapshot mutex is not poisoned") = Some(state.clone());
+                if !no_install
+                    && self.script_resolution_state_before_edit.is_some()
+                    && let Some(guard) = script_resolution_guard.as_ref()
+                    && let Err(error) = guard.store(updated_lock_file.as_lock_file()).await
+                {
+                    tracing::warn!(
+                        %error,
+                        "failed to shadow the script resolution before synchronization"
+                    );
+                }
+                Some(state)
+            } else if !dry_run {
+                updated_lock_file.write_to_disk()?;
+                None
+            } else {
+                None
+            };
+            (updated_lock_file, published_script_lock_state)
+        };
+        let mut prefix_synchronized = false;
         if !no_install
             && !dry_run
             && self.workspace().environments().len() == 1
@@ -545,11 +861,58 @@ impl WorkspaceMut {
                         &crate::environment::InstallFilter::default(),
                     )
                     .await?;
+                prefix_synchronized = true;
             } else {
                 tracing::info!(
                     "Skipping prefix installation: no platform supported by environment '{}' matches the current system",
                     default_environment.name().fancy_display()
                 );
+            }
+        }
+
+        if prefix_synchronized && let Some(expected) = published_script_lock_state.as_ref() {
+            let script_resolution_guard = match self
+                .workspace()
+                .acquire_script_resolution_state()
+                .await
+            {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "failed to refresh the cached script resolution; the sidecar lock remains authoritative"
+                    );
+                    None
+                }
+            };
+            self.workspace().ensure_script_metadata_unchanged().await?;
+            let current_sidecar = self.workspace().script_lock_file_state().await?;
+            if &current_sidecar == expected {
+                if let Some(guard) = script_resolution_guard.as_ref()
+                    && let Err(error) = guard.store(updated_lock_file.as_lock_file()).await
+                {
+                    tracing::warn!(
+                        %error,
+                        "failed to refresh the cached script resolution; the sidecar lock remains authoritative"
+                    );
+                }
+            } else {
+                let sidecar_became_hidden = current_sidecar.is_absent()
+                    && if let Some(guard) = script_resolution_guard.as_ref() {
+                        script_resolutions_equal(
+                            Some(updated_lock_file.as_lock_file()),
+                            guard.load(self.workspace()).await.as_ref(),
+                        )?
+                    } else {
+                        false
+                    };
+                if !sidecar_became_hidden {
+                    drop(script_resolution_guard);
+                    self.workspace()
+                        .reconcile_script_prefix_to_authority()
+                        .await?;
+                    return Err(crate::workspace::ScriptResolutionConflictError.into());
+                }
             }
         }
 
@@ -774,6 +1137,13 @@ impl Drop for WorkspaceMut {
         if let (Some(workspace), Some(original)) = (self.workspace.take(), self.original.take())
             && self.modified
         {
+            if workspace.is_script() {
+                tracing::warn!(
+                    path = %workspace.workspace.provenance.path.display(),
+                    "leaving an interrupted script manifest edit in place to avoid overwriting concurrent changes"
+                );
+                return;
+            }
             let path = workspace.workspace.provenance.path;
             if let Err(err) = pixi_utils::atomic_write::atomic_write_sync(&path, &original.source) {
                 tracing::error!(
@@ -784,4 +1154,18 @@ impl Drop for WorkspaceMut {
             }
         }
     }
+}
+
+async fn solve_dependency_lock_file<'workspace>(
+    workspace: &'workspace Workspace,
+    lock_file: LockFile,
+    no_install: bool,
+) -> miette::Result<LockFileDerivedData<'workspace>> {
+    UpdateContext::builder(workspace, workspace.command_dispatcher_builder()?.finish())?
+        .with_lock_file(lock_file)
+        .with_no_install(no_install)
+        .finish()
+        .await?
+        .update()
+        .await
 }

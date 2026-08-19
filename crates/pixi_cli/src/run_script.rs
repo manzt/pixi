@@ -24,6 +24,23 @@ pub(crate) enum RunScriptInput {
     Stdin,
 }
 
+/// Build the stable cache identity for a transient script.
+///
+/// Remote and stdin metadata can contain paths relative to the invocation's
+/// working directory. Include that semantic root so two otherwise identical
+/// inputs cannot reuse a prefix containing an artifact from another directory.
+pub(crate) fn transient_script_cache_key(kind: &[u8], identity: &[u8], root: &Path) -> Vec<u8> {
+    let mut key = Vec::with_capacity(
+        kind.len() + identity.len() + root.as_os_str().as_encoded_bytes().len() + 2,
+    );
+    key.extend_from_slice(kind);
+    key.push(0);
+    key.extend_from_slice(identity);
+    key.push(0);
+    key.extend_from_slice(root.as_os_str().as_encoded_bytes());
+    key
+}
+
 impl RunScriptInput {
     pub(crate) fn classify(input: &Path) -> Self {
         if input == Path::new("-") {
@@ -285,6 +302,7 @@ fn friendly_name(url: &Url) -> String {
 mod tests {
     use super::{
         Gist, RunScriptInput, friendly_name, gist_id, resolve_gist_at, safe_url, select_gist_file,
+        transient_script_cache_key,
     };
     use std::{
         io::{Read, Write},
@@ -352,6 +370,19 @@ mod tests {
             RunScriptInput::classify(Path::new("-")),
             RunScriptInput::Stdin
         ));
+    }
+
+    #[test]
+    fn transient_cache_identity_includes_the_semantic_root() {
+        let identity = b"dependencies = ['demo @ ./demo.whl']";
+        let first = transient_script_cache_key(b"stdin", identity, Path::new("/workspace/one"));
+        let second = transient_script_cache_key(b"stdin", identity, Path::new("/workspace/two"));
+
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            transient_script_cache_key(b"stdin", identity, Path::new("/workspace/one"))
+        );
     }
 
     #[test]

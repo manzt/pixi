@@ -6723,11 +6723,13 @@ dependencies = [
 name = "pixi_core"
 version = "0.1.0"
 dependencies = [
+ "async-fd-lock",
  "async-once-cell",
  "barrier_cell",
  "console",
  "dashmap",
  "dialoguer",
+ "dirs",
  "dunce",
  "fancy_display",
  "fs-err",
@@ -6822,6 +6824,7 @@ dependencies = [
  "uv-resolver",
  "uv-types",
  "uv-workspace",
+ "windows-sys 0.61.2",
  "xxhash-rust",
 ]
 

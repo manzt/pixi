@@ -160,6 +160,18 @@ pub struct ScriptWorkspaceConfig {
     pub platforms_explicit: bool,
 }
 
+/// Canonical semantic inputs that can affect a PEP 723 script environment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScriptEnvironmentFingerprint(serde_value::Value);
+
+/// Exact editable inputs from a PEP 723 block, including their TOML spelling.
+///
+/// Mutation commands use this fingerprint to avoid overwriting concurrent
+/// comments or formatting changes inside environment-bearing fields. Unrelated
+/// tool settings are excluded so they can still be rebased onto the edit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScriptEnvironmentEditFingerprint(String);
+
 #[derive(Debug, Clone, Copy)]
 enum LineEnding {
     Lf,
@@ -323,6 +335,29 @@ impl ScriptManifest {
             .map_err(|error: toml_edit::TomlError| self.metadata_error(error.into(), 0))
     }
 
+    /// Return a stable representation of the metadata that can affect the
+    /// script environment.
+    ///
+    /// Python source, TOML formatting, comments, and unrelated tool settings
+    /// do not affect dependency resolution or installation and are excluded.
+    pub fn environment_metadata_fingerprint(
+        &self,
+    ) -> Result<ScriptEnvironmentFingerprint, ScriptManifestError> {
+        let document = project_environment_metadata(self.metadata_document()?, true)?;
+        let value: serde_value::Value = toml_edit::de::from_document(document)
+            .map_err(|error| self.metadata_error(error.into(), 0))?;
+        Ok(ScriptEnvironmentFingerprint(value))
+    }
+
+    /// Return the exact spelling of environment-bearing metadata.
+    pub fn environment_metadata_edit_fingerprint(
+        &self,
+    ) -> Result<ScriptEnvironmentEditFingerprint, ScriptManifestError> {
+        Ok(ScriptEnvironmentEditFingerprint(
+            project_environment_metadata(self.metadata_document()?, false)?.to_string(),
+        ))
+    }
+
     /// Present the script metadata as a synthetic pyproject document for Pixi's editors.
     pub fn pyproject_document(&self) -> Result<DocumentMut, ScriptManifestError> {
         Ok(inline_pyproject(self, &self.context.project_name)?.document)
@@ -371,14 +406,61 @@ impl ScriptManifest {
 
     /// Replace the metadata block while preserving the Python around it.
     pub fn write_metadata(&self, metadata: &DocumentMut) -> Result<(), ScriptManifestError> {
-        let contents = format!(
+        let contents = self.render_metadata_document(metadata);
+        fs_err::write(&self.path, contents)?;
+        Ok(())
+    }
+
+    /// Render a raw PEP 723 metadata document while preserving Python source.
+    pub fn render_metadata_document(&self, metadata: &DocumentMut) -> String {
+        format!(
             "{}{}{}",
             self.prelude,
             serialize_metadata(&metadata.to_string(), self.line_ending.as_str()),
             self.postlude
-        );
-        fs_err::write(&self.path, contents)?;
-        Ok(())
+        )
+    }
+
+    /// Restore environment-bearing fields from `source` while preserving the
+    /// current Python body and unrelated tool settings.
+    pub fn render_environment_metadata_from(
+        &self,
+        source: &ScriptManifest,
+    ) -> Result<String, ScriptManifestError> {
+        let mut current = self.metadata_document()?;
+        let source = source.metadata_document()?;
+
+        for key in ["dependencies", "requires-python"] {
+            if let Some(item) = source.get(key) {
+                current[key] = item.clone();
+            } else {
+                current.remove(key);
+            }
+        }
+
+        for name in ["pixi", "uv"] {
+            let source_item = source
+                .get("tool")
+                .and_then(Item::as_table_like)
+                .and_then(|tool| tool.get(name))
+                .cloned();
+            if let Some(item) = source_item {
+                ensure_metadata_tool_table(&mut current)?;
+                current["tool"][name] = item;
+            } else if let Some(tool) = current.get_mut("tool").and_then(Item::as_table_like_mut) {
+                tool.remove(name);
+            }
+        }
+
+        if current
+            .get("tool")
+            .and_then(Item::as_table_like)
+            .is_some_and(|tool| tool.is_empty())
+        {
+            current.remove("tool");
+        }
+
+        Ok(self.render_metadata_document(&current))
     }
 
     /// Render edits to the synthetic pyproject back into the inline metadata block.
@@ -446,6 +528,40 @@ impl ScriptManifest {
             self.postlude
         ))
     }
+}
+
+fn project_environment_metadata(
+    source: DocumentMut,
+    normalize_dependencies: bool,
+) -> Result<DocumentMut, ScriptManifestError> {
+    let mut projected = DocumentMut::new();
+    if let Some(dependencies) = source.get("dependencies") {
+        projected["dependencies"] = dependencies.clone();
+    } else if normalize_dependencies {
+        projected["dependencies"] = Item::Value(Value::Array(Array::new()));
+    }
+    if let Some(requires_python) = source.get("requires-python") {
+        projected["requires-python"] = requires_python.clone();
+    }
+
+    if let Some(mut tool) = source.get("tool").cloned() {
+        let table = tool
+            .as_table_like_mut()
+            .ok_or(ScriptManifestError::InvalidToolTable)?;
+        let unrelated = table
+            .iter()
+            .map(|(name, _)| name.to_owned())
+            .filter(|name| !matches!(name.as_str(), "pixi" | "uv"))
+            .collect::<Vec<_>>();
+        for name in unrelated {
+            table.remove(&name);
+        }
+        if !table.is_empty() {
+            projected["tool"] = tool;
+        }
+    }
+
+    Ok(projected)
 }
 
 fn ensure_metadata_tool_table(metadata: &mut DocumentMut) -> Result<(), ScriptManifestError> {
@@ -1533,5 +1649,172 @@ print("hello")
                 .is_none()
         );
         assert_eq!(metadata["requires-python"].as_str(), Some(">=3.11"));
+    }
+
+    fn environment_fingerprint(source: &str) -> ScriptEnvironmentFingerprint {
+        ScriptManifest::from_source("example.py", source.as_bytes())
+            .unwrap()
+            .unwrap()
+            .environment_metadata_fingerprint()
+            .unwrap()
+    }
+
+    #[test]
+    fn environment_fingerprint_ignores_non_environment_edits() {
+        let first = environment_fingerprint(
+            r#"# /// script
+# dependencies = ["requests"]
+# requires-python = ">=3.11"
+#
+# [tool.pixi.workspace]
+# channels = ["conda-forge"]
+# platforms = ["linux-64"]
+#
+# [tool.ruff]
+# line-length = 88
+# ///
+print("first")
+"#,
+        );
+        let reformatted = environment_fingerprint(
+            r#"# /// script
+# requires-python=">=3.11"
+# dependencies=["requests"] # same requirements
+#
+# [tool.ruff]
+# line-length = 120
+# [tool.unrelated]
+# nonfinite = nan
+# observed = 1979-05-27T07:32:00Z
+#
+# [tool.pixi.workspace]
+# platforms=["linux-64"]
+# channels=["conda-forge"]
+# ///
+print("different body")
+"#,
+        );
+
+        assert_eq!(first, reformatted);
+        assert_eq!(
+            environment_fingerprint("# /// script\n# ///\n"),
+            environment_fingerprint("# /// script\n# dependencies = []\n# ///\n")
+        );
+    }
+
+    #[test]
+    fn edit_fingerprint_tracks_environment_spelling_but_not_unrelated_tools() {
+        let baseline = ScriptManifest::from_source(
+            "example.py",
+            b"# /// script\n# dependencies = [\"requests\"]\n# ///\nprint('first')\n",
+        )
+        .unwrap()
+        .unwrap();
+        let body_and_tool_edit = ScriptManifest::from_source(
+            "example.py",
+            b"# /// script\n# dependencies = [\"requests\"]\n# [tool.ruff]\n# line-length = 120\n# ///\nprint('second')\n",
+        )
+        .unwrap()
+        .unwrap();
+        let environment_comment_edit = ScriptManifest::from_source(
+            "example.py",
+            b"# /// script\n# dependencies = [\"requests\"] # keep this comment\n# ///\nprint('first')\n",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            baseline.environment_metadata_edit_fingerprint().unwrap(),
+            body_and_tool_edit
+                .environment_metadata_edit_fingerprint()
+                .unwrap()
+        );
+        assert_ne!(
+            baseline.environment_metadata_edit_fingerprint().unwrap(),
+            environment_comment_edit
+                .environment_metadata_edit_fingerprint()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn environment_fingerprint_tracks_every_supported_environment_input() {
+        let baseline = environment_fingerprint(
+            r#"# /// script
+# dependencies = ["requests"]
+# requires-python = ">=3.11"
+#
+# [tool.pixi.workspace]
+# channels = ["conda-forge"]
+# platforms = ["linux-64"]
+# ///
+"#,
+        );
+        for changed in [
+            r#"# /// script
+# dependencies = ["httpx"]
+# requires-python = ">=3.11"
+# [tool.pixi.workspace]
+# channels = ["conda-forge"]
+# platforms = ["linux-64"]
+# ///
+"#,
+            r#"# /// script
+# dependencies = ["requests"]
+# requires-python = ">=3.12"
+# [tool.pixi.workspace]
+# channels = ["conda-forge"]
+# platforms = ["linux-64"]
+# ///
+"#,
+            r#"# /// script
+# dependencies = ["requests"]
+# requires-python = ">=3.11"
+# [tool.pixi.workspace]
+# channels = ["testing"]
+# platforms = ["linux-64"]
+# ///
+"#,
+            r#"# /// script
+# dependencies = ["requests"]
+# requires-python = ">=3.11"
+# [tool.pixi.workspace]
+# channels = ["conda-forge"]
+# platforms = ["osx-64"]
+# ///
+"#,
+            r#"# /// script
+# dependencies = ["requests"]
+# requires-python = ">=3.11"
+# [tool.pixi.workspace]
+# channels = ["conda-forge"]
+# platforms = ["linux-64"]
+# [tool.pixi.activation.env]
+# TOKEN = "changed"
+# ///
+"#,
+            r#"# /// script
+# dependencies = ["requests"]
+# requires-python = ">=3.11"
+# [tool.pixi.workspace]
+# channels = ["conda-forge"]
+# platforms = ["linux-64"]
+# [tool.uv]
+# prerelease = "allow"
+# ///
+"#,
+            r#"# /// script
+# dependencies = ["requests"]
+# requires-python = ">=3.11"
+# [tool.pixi.workspace]
+# channels = ["conda-forge"]
+# platforms = ["linux-64"]
+# [tool.pixi.dependencies]
+# tasks = ">=1"
+# ///
+"#,
+        ] {
+            assert_ne!(baseline, environment_fingerprint(changed));
+        }
     }
 }

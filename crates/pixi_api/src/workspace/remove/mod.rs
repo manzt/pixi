@@ -42,6 +42,17 @@ pub enum RemoveError {
     LockFileUpdate(Box<dyn Diagnostic + Send + Sync + 'static>),
 }
 
+async fn save_dependency_edit(
+    workspace: WorkspaceMut,
+    lock_file_usage: LockFileUsage,
+) -> Result<pixi_core::Workspace, std::io::Error> {
+    if workspace.workspace().is_script() && lock_file_usage == LockFileUsage::DryRun {
+        workspace.save_and_clear_script_resolution().await
+    } else {
+        workspace.save().await
+    }
+}
+
 impl From<RemoveDependencyError> for RemoveError {
     fn from(value: RemoveDependencyError) -> Self {
         match value {
@@ -85,7 +96,9 @@ pub async fn remove_conda_deps(
             &options.feature,
         )?;
     }
-    let workspace = workspace.save().await.map_err(RemoveError::Save)?;
+    let workspace = save_dependency_edit(workspace, options.lock_file_usage)
+        .await
+        .map_err(RemoveError::Save)?;
 
     // TODO: update all environments touched by this feature defined.
     // updating prefix after removing from toml
@@ -121,7 +134,9 @@ pub async fn remove_pypi_deps(
             .remove_pypi_dependency(name, &options.platforms, &options.feature)?;
     }
 
-    let workspace = workspace.save().await.map_err(RemoveError::Save)?;
+    let workspace = save_dependency_edit(workspace, options.lock_file_usage)
+        .await
+        .map_err(RemoveError::Save)?;
 
     // TODO: update all environments touched by this feature defined.
     // updating prefix after removing from toml

@@ -4,6 +4,7 @@ use std::{
     ffi::OsString,
     io::Read,
     string::String,
+    sync::Arc,
 };
 
 #[cfg(unix)]
@@ -15,15 +16,19 @@ use dialoguer::theme::ColorfulTheme;
 use fancy_display::FancyDisplay;
 use indicatif::ProgressDrawTarget;
 use itertools::Itertools;
-use miette::{Diagnostic, IntoDiagnostic};
+use miette::{Context, Diagnostic, IntoDiagnostic};
 use pixi_config::{ConfigCli, ConfigCliActivation};
 use pixi_core::{
     Workspace, WorkspaceLocator,
-    environment::sanity_check_workspace,
-    lock_file::{ReinstallPackages, UpdateLockFileOptions, UpdateMode},
+    environment::{InstallFilter, LockFileUsage, sanity_check_workspace},
+    lock_file::{
+        LockFileDerivedData, LockFileInput, ReinstallPackages, SatisfiabilityMode,
+        UpdateLockFileOptions, UpdateMode,
+    },
     workspace::{
-        Environment,
+        Environment, ScriptResolutionStateGuard,
         errors::UnsupportedPlatformError,
+        script_resolutions_equal,
         virtual_packages::{
             EnvironmentRunnability, classify_environment_runnability,
             verify_current_platform_can_run_environment,
@@ -37,6 +42,7 @@ use pixi_task::{
     PreferExecutable, SearchEnvironments, TaskAndEnvironment, TaskGraph, get_task_env,
 };
 use rattler_conda_types::Platform;
+use rattler_lock::LockFile;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::Level;
@@ -48,7 +54,7 @@ use crate::cli_config::{
 use crate::process_exit;
 use crate::run_script::{
     RunScriptInput, STDIN_SCRIPT_COMMAND, StdinScriptCommand, prepare_remote_script,
-    prepare_stdin_script,
+    prepare_stdin_script, transient_script_cache_key,
 };
 use crate::shared::install_platform::resolve_install_platform;
 
@@ -177,21 +183,24 @@ pub async fn execute(mut args: Args) -> miette::Result<()> {
         .script
         .as_deref()
         .map(RunScriptInput::classify);
+    let requested_lock_file_usage = args.lock_and_install_config.lock_file_usage()?;
     let global_config_source = args.config_source.source();
     let mut transient_lock_file_usage = None;
     let mut _remote_script_file = None;
     let mut stdin_script_command = None;
     let workspace = match script_input {
         Some(RunScriptInput::Remote(url)) => {
-            transient_lock_file_usage = Some(transient_script_lock_file_usage(
-                args.lock_and_install_config.lock_file_usage()?,
-            )?);
+            transient_lock_file_usage =
+                Some(transient_script_lock_file_usage(requested_lock_file_usage)?);
             let root = std::env::current_dir().into_diagnostic()?;
             let config = pixi_config::Config::load_with(&root, &global_config_source)
                 .merge_config(cli_config);
             let prepared = prepare_remote_script(url, &config, &root).await?;
-            let mut cache_key = b"remote\0".to_vec();
-            cache_key.extend_from_slice(prepared.original_url.as_str().as_bytes());
+            let cache_key = transient_script_cache_key(
+                b"remote",
+                prepared.original_url.as_str().as_bytes(),
+                &root,
+            );
             let WithWarnings {
                 value: workspace,
                 warnings,
@@ -210,9 +219,8 @@ pub async fn execute(mut args: Args) -> miette::Result<()> {
             workspace
         }
         Some(RunScriptInput::Stdin) => {
-            transient_lock_file_usage = Some(transient_script_lock_file_usage(
-                args.lock_and_install_config.lock_file_usage()?,
-            )?);
+            transient_lock_file_usage =
+                Some(transient_script_lock_file_usage(requested_lock_file_usage)?);
             let root = std::env::current_dir().into_diagnostic()?;
             let config = pixi_config::Config::load_with(&root, &global_config_source)
                 .merge_config(cli_config);
@@ -221,8 +229,11 @@ pub async fn execute(mut args: Args) -> miette::Result<()> {
                 .read_to_end(&mut contents)
                 .into_diagnostic()?;
             let prepared = prepare_stdin_script(contents, &root)?;
-            let mut cache_key = b"stdin\0".to_vec();
-            cache_key.extend_from_slice(prepared.manifest.metadata().as_bytes());
+            let cache_key = transient_script_cache_key(
+                b"stdin",
+                prepared.manifest.metadata().as_bytes(),
+                &root,
+            );
             let WithWarnings {
                 value: workspace,
                 warnings,
@@ -250,6 +261,21 @@ pub async fn execute(mut args: Args) -> miette::Result<()> {
             .with_search_start(args.workspace_config.workspace_locator_start())
             .with_cli_config(cli_config)
             .locate()?,
+    };
+
+    // Resolve script candidates in a disposable prefix. Dynamic PyPI metadata
+    // may execute build backends or activation while solving, and a candidate
+    // must not mutate the real cached prefix before it wins publication.
+    let script_solve_workspace = if is_script {
+        let temp_dir = tempfile::tempdir()
+            .into_diagnostic()
+            .context("failed to create a temporary script solve environment")?;
+        let solve_workspace = workspace
+            .clone()
+            .with_script_pixi_dir(temp_dir.path().join("environment"));
+        Some((temp_dir, solve_workspace))
+    } else {
+        None
     };
 
     let stdin_display_args = if stdin_script_command.is_some() {
@@ -332,28 +358,45 @@ pub async fn execute(mut args: Args) -> miette::Result<()> {
     let progress = pixi_reporters::TopLevelProgress::from_global();
 
     // Ensure that the lock file is up-to-date.
+    let has_script_lock_file = is_script
+        && workspace
+            .persistent_lock_file_path()
+            .is_some_and(|path| path.is_file());
     let lock_file_usage = match transient_lock_file_usage {
         Some(lock_file_usage) => lock_file_usage,
-        None => script_lock_file_usage(
-            args.lock_and_install_config.lock_file_usage()?,
-            is_script,
-            workspace
-                .persistent_lock_file_path()
-                .is_some_and(|path| path.is_file()),
-        )?,
+        None => script_lock_file_usage(requested_lock_file_usage, is_script, has_script_lock_file)?,
     };
-    let mut lock_file = workspace
-        .update_lock_file(
-            Some(progress.clone()),
-            UpdateLockFileOptions {
-                lock_file_usage,
+    let mut lock_file = if is_script {
+        prepare_script_environment(
+            &workspace,
+            script_solve_workspace
+                .as_ref()
+                .map(|(_, workspace)| workspace)
+                .expect("script workspaces always have a disposable solve workspace"),
+            ScriptRunOptions {
+                progress: progress.clone(),
+                requested_lock_file_usage,
+                transient: transient_lock_file_usage.is_some(),
                 no_install: args.lock_and_install_config.no_install(),
-                max_concurrent_solves: workspace.config().max_concurrent_solves(),
-                ..Default::default()
+                dry_run: args.dry_run,
+                user_platform: user_platform.as_ref(),
             },
         )
         .await?
-        .0;
+    } else {
+        workspace
+            .update_lock_file(
+                Some(progress.clone()),
+                UpdateLockFileOptions {
+                    lock_file_usage,
+                    no_install: args.lock_and_install_config.no_install(),
+                    max_concurrent_solves: workspace.config().max_concurrent_solves(),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .0
+    };
 
     // Only an explicit `--platform` pins the global target; the implicit
     // auto-upgrade is resolved per-environment in the loop below, since a
@@ -550,7 +593,8 @@ pub async fn execute(mut args: Args) -> miette::Result<()> {
                 // require a virtual package the machine lacks, so skip the
                 // prefix build and platform validation -- its tasks run
                 // anywhere, relying only on the host environment.
-                if args.lock_and_install_config.allow_installs()
+                if !is_script
+                    && args.lock_and_install_config.allow_installs()
                     && runnability != Some(EnvironmentRunnability::NoDependencies)
                 {
                     // No `--platform`: pin to the platform this environment was
@@ -682,6 +726,320 @@ fn command_not_found<'p>(workspace: &'p Workspace, explicit_environment: Option<
             Platform::current()
         );
     }
+}
+
+const MAX_SCRIPT_RUN_ATTEMPTS: usize = 3;
+
+struct ScriptRunOptions<'platform> {
+    progress: Arc<pixi_reporters::TopLevelProgress>,
+    requested_lock_file_usage: LockFileUsage,
+    transient: bool,
+    no_install: bool,
+    dry_run: bool,
+    user_platform: Option<&'platform PixiPlatformName>,
+}
+
+/// Resolve, publish, and synchronize a script environment without holding its
+/// publication guard across activation-capable solve or prefix work.
+async fn prepare_script_environment<'p>(
+    workspace: &'p Workspace,
+    solve_workspace: &Workspace,
+    options: ScriptRunOptions<'_>,
+) -> miette::Result<LockFileDerivedData<'p>> {
+    let ScriptRunOptions {
+        progress,
+        requested_lock_file_usage,
+        transient,
+        no_install,
+        dry_run,
+        user_platform,
+    } = options;
+    for attempt in 1..=MAX_SCRIPT_RUN_ATTEMPTS {
+        let has_sidecar = workspace
+            .persistent_lock_file_path()
+            .is_some_and(|path| path.is_file());
+        let lock_file_usage = if transient {
+            transient_script_lock_file_usage(requested_lock_file_usage)?
+        } else {
+            script_lock_file_usage(requested_lock_file_usage, true, has_sidecar)?
+        };
+        let initial_guard = acquire_script_resolution_state(workspace).await;
+        workspace.ensure_script_metadata_unchanged().await?;
+        let sidecar_state = if has_sidecar {
+            Some(workspace.script_lock_file_state().await?)
+        } else {
+            None
+        };
+        let baseline = load_script_run_resolution(
+            workspace,
+            has_sidecar,
+            initial_guard.as_ref(),
+            dry_run,
+            lock_file_usage,
+        )
+        .await?;
+        drop(initial_guard);
+
+        let satisfiability = if has_sidecar {
+            SatisfiabilityMode::Exact
+        } else {
+            SatisfiabilityMode::Sufficient
+        };
+        let (solved, mut updated) = solve_workspace
+            .update_lock_file(
+                Some(progress.clone()),
+                UpdateLockFileOptions {
+                    lock_file_usage,
+                    no_install,
+                    max_concurrent_solves: workspace.config().max_concurrent_solves(),
+                    lock_file_input: LockFileInput::Ephemeral {
+                        lock_file: baseline.clone().unwrap_or_default(),
+                        satisfiability,
+                    },
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let mut candidate = rebind_script_lock_file(workspace, solved)?;
+        candidate.target_platform = user_platform.cloned();
+
+        // uv applies permissive requirement checks to the installed
+        // environment itself. Our reusable metadata is separate from the
+        // prefix, so only take the same fast path when the completed-install
+        // marker proves this exact resolution is present. Otherwise validate
+        // the cached resolution exactly under current acquisition policy before
+        // using it to repair the prefix.
+        if !has_sidecar
+            && satisfiability == SatisfiabilityMode::Sufficient
+            && !updated
+            && !dry_run
+            && !no_install
+            && !candidate.prefix_is_up_to_date(&workspace.default_environment())?
+        {
+            let (solved, exact_updated) = solve_workspace
+                .update_lock_file(
+                    Some(progress.clone()),
+                    UpdateLockFileOptions {
+                        lock_file_usage,
+                        no_install,
+                        max_concurrent_solves: workspace.config().max_concurrent_solves(),
+                        lock_file_input: LockFileInput::Ephemeral {
+                            lock_file: baseline.clone().unwrap_or_default(),
+                            satisfiability: SatisfiabilityMode::Exact,
+                        },
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            candidate = rebind_script_lock_file(workspace, solved)?;
+            candidate.target_platform = user_platform.cloned();
+            updated = exact_updated;
+        }
+
+        if dry_run {
+            workspace.ensure_script_metadata_unchanged().await?;
+            return Ok(candidate);
+        }
+
+        // Publish only if the metadata, authority kind, and baseline remained
+        // unchanged while resolution ran.
+        let publish_guard = acquire_script_resolution_state(workspace).await;
+        workspace.ensure_script_metadata_unchanged().await?;
+        let current_has_sidecar = workspace
+            .persistent_lock_file_path()
+            .is_some_and(|path| path.is_file());
+        let current = load_script_run_resolution(
+            workspace,
+            current_has_sidecar,
+            publish_guard.as_ref(),
+            false,
+            lock_file_usage,
+        )
+        .await?;
+        let sidecar_is_current = match sidecar_state.as_ref() {
+            Some(expected) if current_has_sidecar => {
+                workspace
+                    .script_lock_file_state_is_current(expected)
+                    .await?
+            }
+            Some(_) => false,
+            None => !current_has_sidecar,
+        };
+        let baseline_is_current = script_resolutions_equal(baseline.as_ref(), current.as_ref())?;
+
+        if !sidecar_is_current || (publish_guard.is_some() && !baseline_is_current) {
+            drop(publish_guard);
+            if attempt == MAX_SCRIPT_RUN_ATTEMPTS {
+                return Err(pixi_core::workspace::ScriptResolutionConflictError.into());
+            }
+            tracing::debug!(
+                attempt,
+                "script resolution changed; retrying run preparation"
+            );
+            continue;
+        }
+
+        let installing = !no_install;
+        if has_sidecar {
+            if updated {
+                candidate.write_to_disk()?;
+            }
+            if installing
+                && let Some(guard) = publish_guard.as_ref()
+                && let Err(error) = guard.store(candidate.as_lock_file()).await
+            {
+                tracing::warn!(
+                    %error,
+                    "failed to shadow the script resolution before synchronization"
+                );
+            }
+        } else if installing
+            && let Some(guard) = publish_guard.as_ref()
+            && let Err(error) = guard.store(candidate.as_lock_file()).await
+        {
+            tracing::warn!(
+                %error,
+                "failed to cache the script resolution; the environment remains usable"
+            );
+        }
+        drop(publish_guard);
+
+        if !installing {
+            return Ok(candidate);
+        }
+
+        let environment = workspace.default_environment();
+        let runnability = user_platform.is_none().then(|| {
+            classify_environment_runnability(&environment, Some(candidate.as_lock_file()))
+        });
+        if runnability == Some(EnvironmentRunnability::Unsupported) {
+            return Err(
+                match verify_current_platform_can_run_environment(
+                    &environment,
+                    Some(candidate.as_lock_file()),
+                ) {
+                    Err(error) => error.into(),
+                    Ok(()) => environment.unsupported_platform_error().into(),
+                },
+            );
+        }
+
+        if runnability != Some(EnvironmentRunnability::NoDependencies) {
+            if user_platform.is_none() {
+                candidate.target_platform = environment.installed_resolved_platform_name();
+            }
+            candidate
+                .prefix(
+                    &environment,
+                    UpdateMode::QuickValidate,
+                    &ReinstallPackages::default(),
+                    &InstallFilter::default(),
+                )
+                .await?;
+            pixi_core::workspace::virtual_packages::verify_run_platform(
+                &environment,
+                user_platform,
+            )?;
+        }
+
+        let reconcile_guard = acquire_script_resolution_state(workspace).await;
+        workspace.ensure_script_metadata_unchanged().await?;
+        let current_has_sidecar = workspace
+            .persistent_lock_file_path()
+            .is_some_and(|path| path.is_file());
+        let current = load_script_run_resolution(
+            workspace,
+            current_has_sidecar,
+            reconcile_guard.as_ref(),
+            false,
+            lock_file_usage,
+        )
+        .await?;
+        let candidate_is_current = current_has_sidecar == has_sidecar
+            && script_resolutions_equal(Some(candidate.as_lock_file()), current.as_ref())?;
+        let sidecar_became_hidden = has_sidecar
+            && !current_has_sidecar
+            && script_resolutions_equal(Some(candidate.as_lock_file()), current.as_ref())?;
+
+        let uncoordinated_lockless_run =
+            !has_sidecar && !current_has_sidecar && reconcile_guard.is_none();
+        if candidate_is_current || sidecar_became_hidden || uncoordinated_lockless_run {
+            if has_sidecar
+                && let Some(guard) = reconcile_guard.as_ref()
+                && let Err(error) = guard.store(candidate.as_lock_file()).await
+            {
+                tracing::warn!(
+                    %error,
+                    "failed to refresh the cached script resolution; the sidecar lock remains authoritative"
+                );
+            }
+            return Ok(candidate);
+        }
+
+        drop(reconcile_guard);
+        if attempt == MAX_SCRIPT_RUN_ATTEMPTS {
+            workspace.reconcile_script_prefix_to_authority().await?;
+            return Err(pixi_core::workspace::ScriptResolutionConflictError.into());
+        }
+        tracing::debug!(
+            attempt,
+            "script resolution changed during installation; retrying run preparation"
+        );
+    }
+
+    unreachable!("the bounded script run loop always returns")
+}
+
+async fn acquire_script_resolution_state(
+    workspace: &Workspace,
+) -> Option<ScriptResolutionStateGuard> {
+    match workspace.acquire_script_resolution_state().await {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to coordinate the cached script environment; continuing without cached resolution state"
+            );
+            None
+        }
+    }
+}
+
+async fn load_script_run_resolution(
+    workspace: &Workspace,
+    has_sidecar: bool,
+    guard: Option<&ScriptResolutionStateGuard>,
+    allow_unlocked_hidden_read: bool,
+    lock_file_usage: LockFileUsage,
+) -> miette::Result<Option<LockFile>> {
+    if has_sidecar {
+        let loaded = workspace.load_lock_file().await?;
+        if matches!(
+            lock_file_usage,
+            LockFileUsage::Locked | LockFileUsage::Frozen
+        ) {
+            Ok(Some(loaded.into_lock_file()?))
+        } else {
+            Ok(Some(loaded.into_lock_file_or_empty_with_warning()))
+        }
+    } else if let Some(guard) = guard {
+        Ok(guard.load(workspace).await)
+    } else if allow_unlocked_hidden_read {
+        Ok(workspace.load_script_resolution_state().await)
+    } else {
+        Ok(None)
+    }
+}
+
+fn rebind_script_lock_file<'p>(
+    workspace: &'p Workspace,
+    lock_file: LockFileDerivedData<'_>,
+) -> miette::Result<LockFileDerivedData<'p>> {
+    let progress = pixi_reporters::TopLevelProgress::from_global();
+    let dispatcher = progress
+        .register_with(workspace.command_dispatcher_builder()?)
+        .finish();
+    Ok(lock_file.rebind_workspace(workspace, dispatcher))
 }
 
 #[derive(Debug, Error, Diagnostic)]

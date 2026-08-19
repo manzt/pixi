@@ -220,6 +220,43 @@ impl LockFileLoadResult {
     }
 }
 
+fn lock_file_for_usage(
+    lock_file_result: LockFileLoadResult,
+    lock_file_usage: LockFileUsage,
+) -> miette::Result<LockFile> {
+    if lock_file_result.is_version_mismatch()
+        && matches!(
+            lock_file_usage,
+            LockFileUsage::Locked | LockFileUsage::Frozen
+        )
+        && let LockFileLoadResult::VersionMismatch {
+            lock_file_version,
+            max_supported_version,
+        } = lock_file_result
+    {
+        #[cfg(feature = "self_update")]
+        let update_instruction = "Try running `pixi self-update` to update to the latest version.";
+        #[cfg(not(feature = "self_update"))]
+        let update_instruction = "Please update pixi to the latest version and try again.";
+
+        let help_message = format!(
+            "Maximum supported version: {} (pixi v{})\n\
+             Cannot continue with --locked or --frozen mode as the lock file cannot be read.\n\
+             {}",
+            max_supported_version,
+            consts::PIXI_VERSION,
+            update_instruction
+        );
+        return Err(LockFileVersionMismatchError {
+            lock_file_version,
+            help_message,
+        }
+        .into());
+    }
+
+    Ok(lock_file_result.into_lock_file_or_empty_with_warning())
+}
+
 impl Workspace {
     /// Ensures that the lock file is up-to-date with the project.
     ///
@@ -236,6 +273,80 @@ impl Workspace {
     pub async fn update_lock_file(
         &self,
         progress: Option<Arc<pixi_reporters::TopLevelProgress>>,
+        mut options: UpdateLockFileOptions,
+    ) -> miette::Result<(LockFileDerivedData<'_>, bool)> {
+        if !self.is_script() || !options.lock_file_input.should_persist() {
+            return self.update_lock_file_inner(progress, options).await;
+        }
+
+        // A persistent script solve may need an interpreter prefix for dynamic
+        // PyPI metadata. Keep that work disposable until the sidecar candidate
+        // wins optimistic publication.
+        let initial_guard = match self.acquire_script_resolution_state().await {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "failed to coordinate the script lock file; continuing with durable publication"
+                );
+                None
+            }
+        };
+        self.ensure_script_metadata_unchanged().await?;
+        let sidecar_state = self.script_lock_file_state().await?;
+        let baseline = lock_file_for_usage(self.load_lock_file().await?, options.lock_file_usage)?;
+        drop(initial_guard);
+
+        let solve_dir = tempfile::tempdir()
+            .into_diagnostic()
+            .context("failed to create a temporary script solve environment")?;
+        let solve_workspace = self
+            .clone()
+            .with_script_pixi_dir(solve_dir.path().join("environment"));
+        options.lock_file_input = LockFileInput::Ephemeral {
+            lock_file: baseline,
+            satisfiability: super::satisfiability::SatisfiabilityMode::Exact,
+        };
+        let lock_file_usage = options.lock_file_usage;
+        let shadow_script_resolution = options.shadow_script_resolution;
+        let (solved, updated) = solve_workspace
+            .update_lock_file_inner(progress.clone(), options)
+            .await?;
+
+        let mut builder = self.command_dispatcher_builder()?;
+        if let Some(progress) = progress {
+            builder = progress.register_with(builder);
+        }
+        let candidate = solved.rebind_workspace(self, builder.finish());
+
+        let publish_guard = match self.acquire_script_resolution_state().await {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "failed to coordinate the script lock file; continuing with durable publication"
+                );
+                None
+            }
+        };
+        self.ensure_script_metadata_unchanged().await?;
+        self.ensure_script_lock_file_state(&sidecar_state).await?;
+        if updated && lock_file_usage != LockFileUsage::DryRun {
+            candidate.write_to_disk()?;
+        }
+        if shadow_script_resolution
+            && lock_file_usage != LockFileUsage::DryRun
+            && let Some(guard) = publish_guard.as_ref()
+        {
+            guard.store(candidate.as_lock_file()).await?;
+        }
+
+        Ok((candidate, updated))
+    }
+
+    async fn update_lock_file_inner(
+        &self,
+        progress: Option<Arc<pixi_reporters::TopLevelProgress>>,
         options: UpdateLockFileOptions,
     ) -> miette::Result<(LockFileDerivedData<'_>, bool)> {
         let satisfiability = options.lock_file_input.satisfiability();
@@ -243,45 +354,7 @@ impl Workspace {
         let lock_file = if let Some(lock_file) = options.lock_file_input.ephemeral_lock_file() {
             lock_file.clone()
         } else {
-            let lock_file_result = self.load_lock_file().await?;
-
-            // Handle version mismatch - error if --locked or --frozen is set
-            if lock_file_result.is_version_mismatch()
-                && (options.lock_file_usage == LockFileUsage::Locked
-                    || options.lock_file_usage == LockFileUsage::Frozen)
-            {
-                // Extract the version info for the error message
-                if let LockFileLoadResult::VersionMismatch {
-                    lock_file_version,
-                    max_supported_version,
-                } = lock_file_result
-                {
-                    #[cfg(feature = "self_update")]
-                    let update_instruction =
-                        "Try running `pixi self-update` to update to the latest version.";
-                    #[cfg(not(feature = "self_update"))]
-                    let update_instruction =
-                        "Please update pixi to the latest version and try again.";
-
-                    let help_message = format!(
-                        "Maximum supported version: {} (pixi v{})\n\
-                             Cannot continue with --locked or --frozen mode as the lock file cannot be read.\n\
-                             {}",
-                        max_supported_version,
-                        consts::PIXI_VERSION,
-                        update_instruction
-                    );
-
-                    return Err(LockFileVersionMismatchError {
-                        lock_file_version,
-                        help_message,
-                    }
-                    .into());
-                }
-            }
-
-            // Load the lock file, displaying warning if there's a version mismatch
-            lock_file_result.into_lock_file_or_empty_with_warning()
+            lock_file_for_usage(self.load_lock_file().await?, options.lock_file_usage)?
         };
 
         let needs_format_upgrade = lock_file.version() < rattler_lock::FileFormatVersion::LATEST;
@@ -433,8 +506,6 @@ impl Workspace {
             &solved_conda_environments,
             &lock_file_derived_data.lock_file,
         );
-
-        // Write the lock file to disk
 
         if persist_lock_file && options.lock_file_usage != LockFileUsage::DryRun {
             lock_file_derived_data.write_to_disk()?;
@@ -593,6 +664,11 @@ pub struct UpdateLockFileOptions {
     /// Don't install anything to disk.
     pub no_install: bool,
 
+    /// Publish a persistent script candidate to hidden state in the same
+    /// transaction as its sidecar so a concurrent sidecar removal can safely
+    /// transition the following prefix update to lockless authority.
+    pub shadow_script_resolution: bool,
+
     /// If true, rewrite the lock file to the latest format version even when
     /// its content is already up-to-date. Set by `pixi lock`, `pixi update`,
     /// and `pixi upgrade`.
@@ -732,6 +808,30 @@ impl<'p> LockFileDerivedData<'p> {
         }
     }
 
+    /// Rebind this lock file to another workspace and discard runtime state
+    /// derived from the previous workspace's prefixes.
+    ///
+    /// Script updates use this after resolving against a disposable solve
+    /// environment so installation cannot accidentally reuse prefix state or
+    /// command-dispatcher paths from that temporary workspace.
+    pub fn rebind_workspace<'w>(
+        self,
+        workspace: &'w Workspace,
+        command_dispatcher: CommandDispatcher,
+    ) -> LockFileDerivedData<'w> {
+        let package_cache = command_dispatcher.package_cache().clone();
+        let requires_completed_prefix = self.requires_completed_prefix;
+        let mut rebound = LockFileDerivedData::from_input_lock_file(
+            workspace,
+            self.lock_file,
+            package_cache,
+            command_dispatcher,
+            self.glob_hash_cache,
+        );
+        rebound.requires_completed_prefix = requires_completed_prefix;
+        rebound
+    }
+
     /// Returns a resolver for the current lock file, building it on first
     /// access and caching the result.
     pub fn resolver(&self) -> miette::Result<Arc<LockFileResolver>> {
@@ -755,7 +855,7 @@ impl<'p> LockFileDerivedData<'p> {
     }
 
     /// Write the lock file to disk.
-    pub fn write_to_disk(&self) -> miette::Result<()> {
+    pub fn write_to_disk(&self) -> miette::Result<Vec<u8>> {
         // An offline solve records the newest versions available on this
         // machine, which may be older than what the channels offer. The lock
         // file is usually committed, so say so rather than let a downgrade
@@ -786,10 +886,15 @@ impl<'p> LockFileDerivedData<'p> {
             self.workspace.workspace_manifest(),
             self.workspace.root(),
         );
-        lock_file
-            .to_path(&lock_file_path)
+        let contents = lock_file
+            .render_to_string()
             .into_diagnostic()
-            .context("failed to write lock file to disk")
+            .context("failed to serialize lock file")?
+            .into_bytes();
+        pixi_utils::atomic_write::atomic_write_sync_strict(&lock_file_path, &contents)
+            .into_diagnostic()
+            .context("failed to atomically write lock file to disk")?;
+        Ok(contents)
     }
 
     /// Consumes this instance, dropping any resources that are not needed

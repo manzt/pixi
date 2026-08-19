@@ -6,6 +6,7 @@ pub mod grouped_environment;
 mod has_project_ref;
 pub mod registry;
 mod repodata;
+mod script_resolution;
 mod solve_group;
 pub mod stdlib_variants;
 pub mod virtual_packages;
@@ -64,6 +65,10 @@ use pixi_manifest::platform::host::{host_capabilities, host_subdir};
 use rattler_networking::{LazyClient, s3_middleware};
 use rattler_repodata_gateway::Gateway;
 pub use registry::{WorkspaceRegistry, WorkspaceRegistryError};
+pub use script_resolution::{
+    ScriptLockFileState, ScriptResolutionConflictError, ScriptResolutionFileState,
+    ScriptResolutionStateGuard, ScriptResolutionStateLockError, script_resolutions_equal,
+};
 pub use solve_group::SolveGroup;
 use tokio::sync::Semaphore;
 pub use workspace_mut::WorkspaceMut;
@@ -568,6 +573,19 @@ impl Workspace {
             .unwrap_or_else(|| self.default_pixi_dir())
     }
 
+    /// Override the environment directory of a script workspace.
+    ///
+    /// This is intended for operations such as dry-run resolution that need a
+    /// disposable solve prefix without changing the script's identity or
+    /// adjacent lock-file path. Project workspaces are returned unchanged.
+    pub fn with_script_pixi_dir(mut self, path: PathBuf) -> Self {
+        if let WorkspaceStorage::Script { pixi_dir, .. } = &mut self.storage {
+            *pixi_dir = path;
+            self.env_vars = Self::init_env_vars(&self.workspace.value.environments);
+        }
+        self
+    }
+
     /// Create the detached-environments path for this project if it is set in
     /// the config
     fn detached_environments_path(&self) -> Option<PathBuf> {
@@ -724,6 +742,19 @@ impl Workspace {
         match &self.storage {
             WorkspaceStorage::Project => Some(self.root.join(consts::PROJECT_LOCK_FILE)),
             WorkspaceStorage::Script { lock_file_path, .. } => lock_file_path.clone(),
+        }
+    }
+
+    /// Returns whether this workspace was constructed from a PEP 723 script.
+    pub fn is_script(&self) -> bool {
+        matches!(self.storage, WorkspaceStorage::Script { .. })
+    }
+
+    /// Return the parsed PEP 723 manifest for a script workspace.
+    pub fn script_manifest(&self) -> Option<&ScriptManifest> {
+        match &self.storage {
+            WorkspaceStorage::Script { manifest, .. } => Some(manifest),
+            WorkspaceStorage::Project => None,
         }
     }
 

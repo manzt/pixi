@@ -1,7 +1,9 @@
+use std::future::Future;
+
 use indexmap::IndexMap;
-use miette::IntoDiagnostic;
+use miette::{Diagnostic, IntoDiagnostic};
 use pixi_core::{
-    environment::sanity_check_workspace,
+    environment::{LockFileUsage, sanity_check_workspace},
     workspace::{PypiDeps, SkippedPackage, UpdateDeps, WorkspaceMut},
 };
 use pixi_manifest::{
@@ -9,12 +11,44 @@ use pixi_manifest::{
 };
 use pixi_spec::{GitSpec, SourceSpec, Subdirectory};
 use rattler_conda_types::{MatchSpec, PackageName};
+use thiserror::Error;
 
 use crate::workspace::platforms::resolve_platforms;
 
 mod options;
 
 pub use options::{DependencyOptions, GitOptions};
+
+#[derive(Debug, Diagnostic, Error)]
+#[error("dependency update cancelled")]
+pub struct DependencyUpdateCancelled;
+
+async fn await_script_dependency_update<T>(
+    is_script: bool,
+    future: impl Future<Output = T>,
+) -> Option<T> {
+    if is_script {
+        tokio::select! {
+            result = future => Some(result),
+            _ = tokio::signal::ctrl_c() => None,
+        }
+    } else {
+        Some(future.await)
+    }
+}
+
+async fn save_dependency_edit(
+    workspace: WorkspaceMut,
+    is_script: bool,
+    lock_file_usage: LockFileUsage,
+) -> Result<(), std::io::Error> {
+    if is_script && lock_file_usage == LockFileUsage::DryRun {
+        workspace.save_and_clear_script_resolution().await?;
+    } else {
+        workspace.save().await?;
+    }
+    Ok(())
+}
 
 pub async fn add_conda_dep(
     mut workspace: WorkspaceMut,
@@ -87,23 +121,33 @@ pub async fn add_conda_dep(
     let dry_run = false;
 
     let targets = workspace.target_selectors_for_platforms(&dep_options.platforms);
-    let (update_deps, skipped) = match Box::pin(workspace.update_dependencies(
-        match_specs,
-        IndexMap::default(),
-        source_specs,
-        dep_options.no_install,
-        &dep_options.lock_file_usage,
-        &dep_options.feature,
-        &targets,
-        false,
-        dry_run,
-        DependencyOverwriteBehavior::OverwriteIfExplicit,
-    ))
-    .await
-    {
+    let is_script = workspace.workspace().is_script();
+    let update_result = await_script_dependency_update(
+        is_script,
+        Box::pin(workspace.update_dependencies(
+            match_specs,
+            IndexMap::default(),
+            source_specs,
+            dep_options.no_install,
+            &dep_options.lock_file_usage,
+            &dep_options.feature,
+            &targets,
+            false,
+            dry_run,
+            DependencyOverwriteBehavior::OverwriteIfExplicit,
+        )),
+    )
+    .await;
+    let Some(update_result) = update_result else {
+        workspace.revert().await.into_diagnostic()?;
+        return Err(DependencyUpdateCancelled.into());
+    };
+    let (update_deps, skipped) = match update_result {
         Ok(result) => {
             // Write the updated manifest
-            workspace.save().await.into_diagnostic()?;
+            save_dependency_edit(workspace, is_script, dep_options.lock_file_usage)
+                .await
+                .into_diagnostic()?;
             result
         }
         Err(e) => {
@@ -140,23 +184,33 @@ pub async fn add_pypi_dep(
     let dry_run = false;
 
     let targets = workspace.target_selectors_for_platforms(&options.platforms);
-    let (update_deps, skipped) = match Box::pin(workspace.update_dependencies(
-        IndexMap::default(),
-        pypi_deps,
-        IndexMap::default(),
-        options.no_install,
-        &options.lock_file_usage,
-        &options.feature,
-        &targets,
-        editable,
-        dry_run,
-        DependencyOverwriteBehavior::OverwriteIfExplicit,
-    ))
-    .await
-    {
+    let is_script = workspace.workspace().is_script();
+    let update_result = await_script_dependency_update(
+        is_script,
+        Box::pin(workspace.update_dependencies(
+            IndexMap::default(),
+            pypi_deps,
+            IndexMap::default(),
+            options.no_install,
+            &options.lock_file_usage,
+            &options.feature,
+            &targets,
+            editable,
+            dry_run,
+            DependencyOverwriteBehavior::OverwriteIfExplicit,
+        )),
+    )
+    .await;
+    let Some(update_result) = update_result else {
+        workspace.revert().await.into_diagnostic()?;
+        return Err(DependencyUpdateCancelled.into());
+    };
+    let (update_deps, skipped) = match update_result {
         Ok(result) => {
             // Write the updated manifest
-            workspace.save().await.into_diagnostic()?;
+            save_dependency_edit(workspace, is_script, options.lock_file_usage)
+                .await
+                .into_diagnostic()?;
             result
         }
         Err(e) => {
